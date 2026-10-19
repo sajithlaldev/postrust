@@ -825,3 +825,224 @@ fn request_bar_text_is_vertically_centred_with_its_neighbours() {
         );
     }
 }
+
+/// Horizontal extents (min x, max x) of every text shape in one frame, at a given window width.
+fn text_spans(app: &mut App, ctx: &egui::Context, width: f32) -> Vec<(String, f32, f32)> {
+    fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, f32, f32)>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => out.push((
+                t.galley.text().to_string(),
+                t.pos.x + t.galley.rect.min.x,
+                t.pos.x + t.galley.rect.max.x,
+            )),
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let input = RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 800.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input, |ui| postrust::ui::draw(app, ui));
+    let mut found = Vec::new();
+    for clipped in std::mem::take(&mut output.shapes) {
+        walk(&clipped.shape, &mut found);
+    }
+    output.drop_without_applying_deltas();
+    found
+}
+
+#[test]
+fn status_message_never_runs_into_the_shortcut_hints() {
+    for web_mode in [false, true] {
+        for width in [900.0, 1280.0, 1920.0] {
+            for status in ["Ready", "Saved", &"a very long status message ".repeat(30)] {
+                let ctx = egui::Context::default();
+                let mut app = App::new(None);
+                app.web_mode = web_mode;
+                app.status = Some(status.to_string());
+                for _ in 0..3 {
+                    text_spans(&mut app, &ctx, width);
+                }
+                let spans = text_spans(&mut app, &ctx, width);
+                let hints = spans
+                    .iter()
+                    .find(|(t, _, _)| t.contains("K commands") && t.contains("Enter send"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no shortcut hints in {:?}",
+                            spans.iter().map(|s| &s.0).collect::<Vec<_>>()
+                        )
+                    });
+                let message = spans
+                    .iter()
+                    .find(|(t, _, _)| t.starts_with(&status[..status.len().min(5)]) && !t.contains("K commands"))
+                    .unwrap_or_else(|| panic!("no status text for {status:?}"));
+                assert!(
+                    message.2 <= hints.1 + 0.5,
+                    "web={web_mode} width={width}: status ends at {} but the hints start at {} ({status:.20?})",
+                    message.2,
+                    hints.1
+                );
+                assert!(hints.2 <= width + 0.5, "hints must stay inside the window");
+            }
+        }
+    }
+}
+
+#[test]
+fn web_mode_hides_the_browser_reserved_shortcuts() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.web_mode = true;
+    for _ in 0..3 {
+        text_spans(&mut app, &ctx, 1280.0);
+    }
+    let spans = text_spans(&mut app, &ctx, 1280.0);
+    let hints = spans
+        .iter()
+        .find(|(t, _, _)| t.contains("K commands"))
+        .map(|s| s.0.clone())
+        .unwrap();
+    assert!(!hints.contains("new tab") && !hints.contains("close tab"), "{hints}");
+    app.web_mode = false;
+    for _ in 0..3 {
+        text_spans(&mut app, &ctx, 1280.0);
+    }
+    let spans = text_spans(&mut app, &ctx, 1280.0);
+    let hints = spans
+        .iter()
+        .find(|(t, _, _)| t.contains("K commands"))
+        .map(|s| s.0.clone())
+        .unwrap();
+    assert!(hints.contains("new tab") && hints.contains("close tab"), "{hints}");
+}
+
+#[test]
+fn web_import_window_imports_pasted_exports_and_the_forbidden_header_warning_shows() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.web_mode = true;
+    app.show_io = true;
+    let export = postrust::storage::collections_to_json(&[Collection {
+        name: "Pasted".into(),
+        requests: vec![Request::new("one")],
+    }])
+    .unwrap();
+    app.io_text = export;
+    frames(&mut app, &ctx, 3); // the web layout of the window renders
+
+    // What the "Import" button does with the pasted text.
+    let text = std::mem::take(&mut app.io_text);
+    app.import_collections_text(&text);
+    assert_eq!(app.store.collections.len(), 1);
+    assert_eq!(app.store.collections[0].name, "Pasted");
+    app.import_collections_text("not an export");
+    assert!(app.status.as_deref().unwrap().starts_with("Import failed"));
+
+    // The headers tab warns about headers the browser would silently drop.
+    app.tabs[0].req_tab = ReqTab::Headers;
+    app.tabs[0].request.headers = vec![KeyValue::new("Cookie", "a=1"), KeyValue::new("X-Ok", "1")];
+    for _ in 0..3 {
+        text_spans(&mut app, &ctx, 1280.0);
+    }
+    let spans = text_spans(&mut app, &ctx, 1280.0);
+    assert!(
+        spans
+            .iter()
+            .any(|(t, _, _)| t.contains("The browser ignores these headers: Cookie")),
+        "{:?}",
+        spans.iter().map(|s| &s.0).collect::<Vec<_>>()
+    );
+    app.web_mode = false;
+    for _ in 0..3 {
+        text_spans(&mut app, &ctx, 1280.0);
+    }
+    assert!(
+        !text_spans(&mut app, &ctx, 1280.0)
+            .iter()
+            .any(|(t, _, _)| t.contains("browser ignores"))
+    );
+}
+
+#[test]
+fn web_auth_tab_warns_about_api_key_headers_the_browser_drops_or_may_forward() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.web_mode = true;
+    app.tabs[0].req_tab = ReqTab::Auth;
+    let render = |app: &mut App| {
+        for _ in 0..3 {
+            text_spans(app, &ctx, 1280.0);
+        }
+        text_spans(app, &ctx, 1280.0)
+            .into_iter()
+            .map(|s| s.0)
+            .collect::<Vec<_>>()
+    };
+
+    app.tabs[0].request.auth = Auth::ApiKey {
+        name: "X-Api-Key".into(),
+        value: "k".into(),
+    };
+    let texts = render(&mut app);
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("redirects automatically") && t.contains("X-Api-Key")),
+        "{texts:?}"
+    );
+    assert!(!texts.iter().any(|t| t.contains("ignores this header")), "{texts:?}");
+
+    // Any API key is a credential, whatever its name; and a forbidden name is dropped by the browser.
+    app.tabs[0].request.auth = Auth::ApiKey {
+        name: "Cookie".into(),
+        value: "k".into(),
+    };
+    let texts = render(&mut app);
+    assert!(
+        texts.iter().any(|t| t.contains("ignores this header: Cookie")),
+        "{texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("redirects automatically")), "{texts:?}");
+
+    // Bearer and Basic use Authorization, which browsers already strip on redirects.
+    app.tabs[0].request.auth = Auth::Bearer { token: "t".into() };
+    assert!(!render(&mut app).iter().any(|t| t.contains("redirects automatically")));
+
+    // On the desktop none of this shows (its redirect guard handles it).
+    app.web_mode = false;
+    app.tabs[0].request.auth = Auth::ApiKey {
+        name: "X-Api-Key".into(),
+        value: "k".into(),
+    };
+    assert!(
+        !render(&mut app)
+            .iter()
+            .any(|t| t.contains("redirects automatically") || t.contains("ignores this header"))
+    );
+}
+
+#[test]
+fn web_headers_tab_warns_about_credential_headers_on_redirects() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.web_mode = true;
+    app.tabs[0].req_tab = ReqTab::Headers;
+    app.tabs[0].request.headers = vec![KeyValue::new("X-Auth-Token", "t"), KeyValue::new("Accept", "*/*")];
+    for _ in 0..3 {
+        text_spans(&mut app, &ctx, 1280.0);
+    }
+    let texts: Vec<String> = text_spans(&mut app, &ctx, 1280.0).into_iter().map(|s| s.0).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("redirects automatically") && t.contains("X-Auth-Token")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains("redirects automatically") && t.contains("Accept"))
+    );
+}

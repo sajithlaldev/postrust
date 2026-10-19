@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="postrust: a small API client that runs in your browser." />
+    <title>postrust</title>
+    <link data-trunk rel="icon" href="assets/icon-64.png" />
+    <link data-trunk rel="rust" data-bin="postrust" data-wasm-opt="z" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #181a1f; color: #d2d2d2; font-family: system-ui, sans-serif; }
+      canvas { display: block; width: 100%; height: 100%; }
+      #loading { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
+    </style>
+  </head>
+  <body>
+    <canvas id="postrust_canvas"></canvas>
+    <div id="loading">Loading postrust&hellip;</div>
+    <noscript>postrust needs JavaScript and WebAssembly.</noscript>
+  </body>
+</html>

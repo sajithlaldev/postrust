@@ -108,16 +108,42 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
     }
 
     egui::Panel::bottom("status").show(ui, |ui| {
+        let m = theme::modifier(&ctx);
+        let hints = if app.web_mode {
+            // The browser keeps T and W for itself (new tab, close tab); use the buttons.
+            format!("{m}K commands  |  {m}Enter send  |  {m}S save")
+        } else {
+            format!("{m}K commands  |  {m}Enter send  |  {m}S save  |  {m}T new tab  |  {m}W close tab")
+        };
+        let hints_width = ui.fonts_mut(|f| {
+            f.layout_no_wrap(
+                hints.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        });
+        let status = app.status.clone().unwrap_or_else(|| "Ready".into());
         ui.horizontal(|ui| {
-            ui.label(app.status.clone().unwrap_or_else(|| "Ready".into()));
+            // The message gets whatever room the hints leave and is cut with "..." instead of
+            // running into them (the full text is in the tooltip).
+            let room = (ui.available_width() - hints_width - ui.spacing().item_spacing.x * 3.0).max(40.0);
+            let height = ui.spacing().interact_size.y;
+            ui.allocate_ui_with_layout(
+                egui::vec2(room, height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Label::new(status.as_str()).truncate())
+                        .on_hover_text(status.as_str());
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let m = theme::modifier();
-                ui.weak(format!(
-                    "{m}K commands  |  {m}Enter send  |  {m}S save  |  {m}T new tab  |  {m}W close tab"
-                ));
+                ui.weak(hints);
             });
         });
     });
+
     egui::CentralPanel::default()
         .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(14, 10)))
         .show(ui, |ui| {

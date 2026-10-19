@@ -40,6 +40,7 @@ pub fn show(app: &mut App, ctx: &Context) {
     let mut run = None;
 
     let dark = ctx.theme() == egui::Theme::Dark;
+    let app_web_mode = app.web_mode;
     let window = egui::Window::new("command_palette")
         .title_bar(false)
         .resizable(false)
@@ -97,11 +98,13 @@ pub fn show(app: &mut App, ctx: &Context) {
                     egui::FontId::proportional(14.0),
                     ui.visuals().text_color(),
                 );
-                if let Some(key) = entry.shortcut {
+                let browser_reserved =
+                    app_web_mode && matches!(entry.command, commands::Command::NewTab | commands::Command::CloseTab);
+                if let Some(key) = entry.shortcut.filter(|_| !browser_reserved) {
                     ui.painter().text(
                         rect.right_center() - vec2(8.0, 0.0),
                         Align2::RIGHT_CENTER,
-                        format!("{}{}", theme::modifier(), key),
+                        format!("{}{}", theme::modifier(ctx), key),
                         egui::FontId::proportional(12.0),
                         ui.visuals().weak_text_color(),
                     );

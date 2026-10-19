@@ -1,6 +1,7 @@
 use crate::commands::Command;
 use crate::http::{self, ResponseData, pretty_json};
 use crate::model::{Auth, BodyKind, Collection, Environment, Request, SplitLayout, Store, ThemeMode};
+use crate::platform;
 use crate::storage::{self, Storage};
 use crate::{ui, vars};
 use std::sync::{Arc, mpsc};
@@ -28,7 +29,7 @@ pub type Outcome = Result<Resp, String>;
 
 pub struct Pending {
     rx: mpsc::Receiver<Result<Resp, String>>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: platform::Task,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,7 +111,7 @@ pub enum RenameTarget {
 }
 
 pub struct App {
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: platform::Executor,
     http: Arc<http::Http>,
     storage: Option<Storage>,
     pub store: Store,
@@ -122,6 +123,11 @@ pub struct App {
     pub env_sel: usize,
     pub show_io: bool,
     pub io_path: String,
+    /// True in the browser build. Drives the web-specific UI (paste-to-import, shortcut hints,
+    /// header warnings); a plain field, so those layouts can also be tested natively.
+    pub web_mode: bool,
+    /// Import window text box: pasted export JSON (the web build cannot read file paths).
+    pub io_text: String,
     pub rename: Option<(RenameTarget, String)>,
     pub new_collection: String,
     pub status: Option<String>,
@@ -144,13 +150,8 @@ impl App {
         let mut store = storage.as_ref().map(|s| s.load()).unwrap_or_default();
         let load_notice = storage.as_ref().and_then(|s| s.take_notice());
         store.fix_active_env(); // a hand-edited file may point past the environments list
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
         let mut app = Self {
-            rt: Arc::new(rt),
+            rt: platform::Executor::new(),
             http: Arc::new(http::Http::new().expect("http client")),
             storage,
             store,
@@ -161,7 +162,9 @@ impl App {
             show_env: false,
             env_sel: 0,
             show_io: false,
-            io_path: default_export_path(),
+            io_path: platform::default_export_path(),
+            web_mode: cfg!(target_arch = "wasm32"),
+            io_text: String::new(),
             rename: None,
             new_collection: String::new(),
             status: None,
@@ -174,11 +177,7 @@ impl App {
             applied_theme: None,
         };
         app.new_tab(Request::default(), None);
-        if load_notice.is_some() {
-            app.status = load_notice;
-        } else if app.storage.is_none() {
-            app.status = Some("No data directory found: collections and environments will not be saved".into());
-        }
+        app.status = startup_notice(load_notice, app.storage.is_some(), app.web_mode);
         app
     }
 
@@ -431,9 +430,7 @@ impl App {
                 let handle = self.rt.spawn(async move {
                     let res = match client.send(prepared, timeout).await {
                         // Parsing and pretty-printing big bodies must not run on the UI thread.
-                        Ok(data) => tokio::task::spawn_blocking(move || into_resp(data))
-                            .await
-                            .map_err(|e| e.to_string()),
+                        Ok(data) => platform::run_blocking(move || into_resp(data)).await,
                         Err(e) => Err(format!("{e:#}")),
                     };
                     let _ = tx.send(res);
@@ -626,15 +623,10 @@ impl App {
         };
         let d = &resp.data;
         let ext = http::extension_for(d.content_type());
-        let dir = directories::UserDirs::new()
-            .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.status = Some(match write_new_file(&dir, "postrust-response", ext, &d.body) {
-            Ok(path) => format!("Saved response body to {}", path.display()),
-            Err(e) => format!("Could not save body: {e}"),
-        });
+        self.status = Some(save_response_body(d, ext));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn export_collections(&mut self) {
         let path = std::path::PathBuf::from(self.io_path.trim());
         // Only replace an existing file if it is a previous export, never arbitrary user data.
@@ -655,9 +647,47 @@ impl App {
         });
     }
 
+    /// In a browser the export is offered as a file download.
+    #[cfg(target_arch = "wasm32")]
+    pub fn export_collections(&mut self) {
+        let n = self.store.collections.len();
+        self.status = Some(match storage::collections_to_json(&self.store.collections) {
+            Ok(json) => match platform::download("postrust-collections.json", json.as_bytes(), "application/json") {
+                Ok(()) => format!("Export of {n} collection(s) downloaded as postrust-collections.json"),
+                Err(e) => format!("Export failed: {e}"),
+            },
+            Err(e) => format!("Export failed: {e:#}"),
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn import_collections(&mut self) {
         let path = std::path::PathBuf::from(self.io_path.trim());
-        self.status = Some(match storage::import_collections(&path) {
+        let result = storage::import_collections(&path);
+        self.finish_import(result);
+    }
+
+    /// Imports an export that was pasted as text (how the web build imports).
+    /// Returns whether the import succeeded.
+    pub fn import_collections_text(&mut self, text: &str) -> bool {
+        let result = storage::collections_from_json(text);
+        self.finish_import(result)
+    }
+
+    /// Imports the text pasted into the Import window. The text box is emptied only when the
+    /// import worked, so a slightly malformed paste can be fixed in place instead of re-pasted.
+    pub fn import_pasted(&mut self) -> bool {
+        let text = self.io_text.clone();
+        let ok = self.import_collections_text(&text);
+        if ok {
+            self.io_text.clear();
+        }
+        ok
+    }
+
+    fn finish_import(&mut self, result: anyhow::Result<Vec<Collection>>) -> bool {
+        let ok = result.is_ok();
+        self.status = Some(match result {
             Ok(cols) => {
                 let n = cols.len();
                 self.store.collections.extend(cols);
@@ -666,6 +696,7 @@ impl App {
             }
             Err(e) => format!("Import failed: {e:#}"),
         });
+        ok
     }
 
     fn persist(&mut self) {
@@ -685,8 +716,29 @@ impl App {
     }
 }
 
+/// Saves a response body for the user: to the Downloads folder natively...
+#[cfg(not(target_arch = "wasm32"))]
+fn save_response_body(d: &ResponseData, ext: &str) -> String {
+    match write_new_file(&platform::downloads_dir(), "postrust-response", ext, &d.body) {
+        Ok(path) => format!("Saved response body to {}", path.display()),
+        Err(e) => format!("Could not save body: {e}"),
+    }
+}
+
+/// ...and as a browser download on the web.
+#[cfg(target_arch = "wasm32")]
+fn save_response_body(d: &ResponseData, ext: &str) -> String {
+    let name = format!("postrust-response.{ext}");
+    let mime = d.content_type().unwrap_or("application/octet-stream");
+    match platform::download(&name, &d.body, mime) {
+        Ok(()) => format!("Download started: {name}"),
+        Err(e) => format!("Could not save body: {e}"),
+    }
+}
+
 /// Creates `<stem>.<ext>` (or `<stem>-N.<ext>`) with `create_new`, so an existing file or
 /// symlink is never written through and concurrent creators can't be overwritten.
+#[cfg(not(target_arch = "wasm32"))]
 fn write_new_file(dir: &std::path::Path, stem: &str, ext: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     for n in 0..1000 {
@@ -711,6 +763,27 @@ fn write_new_file(dir: &std::path::Path, stem: &str, ext: &str, bytes: &[u8]) ->
     ))
 }
 
+/// The status-bar message shown at start-up: a problem with the saved data comes first, then a
+/// missing place to save (which would otherwise lose everything silently), then the web note.
+fn startup_notice(load_notice: Option<String>, has_storage: bool, web: bool) -> Option<String> {
+    if load_notice.is_some() {
+        load_notice
+    } else if !has_storage {
+        Some(
+            if web {
+                "Browser storage is unavailable (private mode or blocked site data?): your work will NOT be saved"
+            } else {
+                "No data directory found: collections and environments will not be saved"
+            }
+            .into(),
+        )
+    } else if web {
+        Some("Web version: data stays in this browser (plain text). Servers must allow CORS.".into())
+    } else {
+        None
+    }
+}
+
 /// Stores `value` in `slot` if it moved by more than a pixel (avoids rewriting the file for
 /// sub-pixel layout noise).
 fn remember(slot: &mut Option<f32>, value: f32, dirty: &mut bool) {
@@ -718,13 +791,6 @@ fn remember(slot: &mut Option<f32>, value: f32, dirty: &mut bool) {
         *slot = Some(value);
         *dirty = true;
     }
-}
-
-fn default_export_path() -> String {
-    directories::UserDirs::new()
-        .and_then(|d| d.download_dir().map(|p| p.join("postrust-collections.json")))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "postrust-collections.json".into())
 }
 
 /// Cuts `s` to at most `limit` bytes on a char boundary; true if anything was removed.
@@ -807,6 +873,27 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_notice_never_hides_a_missing_place_to_save() {
+        // The web note must not mask "storage unavailable": that case loses all data on reload.
+        let web_without_storage = startup_notice(None, false, true).unwrap();
+        assert!(
+            web_without_storage.contains("will NOT be saved"),
+            "{web_without_storage}"
+        );
+        assert!(
+            startup_notice(None, false, false)
+                .unwrap()
+                .contains("will not be saved")
+        );
+        assert!(startup_notice(None, true, true).unwrap().starts_with("Web version"));
+        assert_eq!(startup_notice(None, true, false), None);
+        // A load problem wins over everything else.
+        for (storage, web) in [(true, true), (false, true), (true, false), (false, false)] {
+            assert_eq!(startup_notice(Some("bad".into()), storage, web).as_deref(), Some("bad"));
+        }
+    }
 
     fn response(content_type: &str, body: &[u8], truncated: bool) -> ResponseData {
         ResponseData {

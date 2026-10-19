@@ -119,9 +119,10 @@ pub fn syntax_colors(dark: bool) -> SyntaxColors {
     }
 }
 
-/// The platform's shortcut modifier as shown to the user ("Cmd+" on macOS, "Ctrl+" elsewhere).
-pub fn modifier() -> &'static str {
-    if cfg!(target_os = "macos") { "Cmd+" } else { "Ctrl+" }
+/// The shortcut modifier as shown to the user ("Cmd+" on Mac, "Ctrl+" elsewhere). Asked of egui
+/// at run time: in a browser the OS is only known from the user agent, not at compile time.
+pub fn modifier(ctx: &Context) -> &'static str {
+    if ctx.os().is_mac() { "Cmd+" } else { "Ctrl+" }
 }
 
 /// Applies the user's System / Light / Dark choice.

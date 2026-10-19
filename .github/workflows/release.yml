@@ -3,6 +3,8 @@ name: Release
 # Builds and publishes a GitHub Release whenever `main` receives a push (i.e. a merged PR),
 # provided the version in Cargo.toml has not been released yet. Bump `version` in Cargo.toml
 # to cut a release; merges that don't bump it do nothing. Pull requests only run the checks.
+# The browser (WebAssembly) build is checked on every run and, on pushes to `main`, deployed to
+# GitHub Pages; that is independent of the release.
 on:
   push:
     branches: [main]
@@ -80,6 +82,58 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # The browser build: lint the wasm target and build the site with Trunk on every run, so a
+  # change that breaks the web build is caught in the PR. On `main` the site is also uploaded
+  # for deployment.
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Lint (web)
+        run: cargo clippy --locked --lib --bin postrust --target wasm32-unknown-unknown -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+      # Trunk downloads wasm-bindgen and wasm-opt on first use (a couple of minutes); keep them.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/trunk
+          key: trunk-tools-${{ runner.os }}-v1
+      - name: Build site
+        run: trunk build --release --locked --public-url "/${{ github.event.repository.name }}/"
+      - name: Upload site
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  # Publishes the site. Needs Pages enabled once: Settings > Pages > Source: GitHub Actions.
+  deploy-web:
+    name: Deploy web to GitHub Pages
+    needs: [check, test, web]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
 
   build:
     name: Build ${{ matrix.name }}

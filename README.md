@@ -25,6 +25,17 @@ cargo bundle --release      # target/release/bundle/osx/postrust.app
 
 The bundle identifier in `Cargo.toml` (`dev.postrust.app`) is a placeholder; change it to your own.
 
+## Web version
+
+postrust also runs in the browser (WebAssembly): **https://sajithlaldev.github.io/postrust/** (deployed from `main`). It is the same app, about 2 MB to download, with these differences:
+
+- **CORS applies.** A web page can only call servers that send CORS headers (`Access-Control-Allow-Origin`). Public APIs such as GitHub or httpbin work; a local or private API needs CORS enabled. The browser doesn't say why a request failed, so the error lists the usual causes. An `https` page also can't call `http` addresses (except `localhost`).
+- **Some headers can't be set.** Browsers silently drop `Cookie`, `Host`, `Origin`, `Referer`, `Content-Length`, `Sec-*`, `Proxy-*` and a few others; the Headers tab warns when you add one. Redirects and compression are handled by the browser, so the redirect-safety rule for credential headers and the timeout precision of the desktop app don't apply.
+- **Data lives in your browser's `localStorage`** (about 5 MB, plain text, per site). Anything else served from the same origin can read it, and `sajithlaldev.github.io` is shared by all of that account's Pages sites, so don't keep real secrets there. Export / import work through a file download and a paste box.
+- **Shortcuts:** `Cmd/Ctrl + T` and `+ W` belong to the browser (use the buttons); the rest work as on the desktop.
+
+To run it locally: `rustup target add wasm32-unknown-unknown`, install [Trunk](https://trunkrs.dev) (`brew install trunk` or `cargo install trunk`), then `trunk serve --release` and open the printed address. The deployment needs Pages enabled once (Settings > Pages > Source: GitHub Actions).
+
 ## Features
 
 - Request builder: method, URL, query params, headers, body (raw / urlencoded form), auth (Bearer, Basic, API key header)
@@ -101,7 +112,7 @@ Plans, not promises. Rough order within each group; open an issue if something m
 - Import and export in the Postman v2.1 collection format
 - Native file dialogs for import, export and "Save body" (today they use a typed path / the Downloads folder)
 - `multipart/form-data` and binary / file bodies
-- Cookie jar, and proxy settings in the app
+- Cookie jar, and proxy settings in the desktop app
 - Search inside responses and a JSON path filter
 - Encrypt saved secrets (OS keychain) instead of plain-text `store.json`
 - Apple notarization and Windows code signing, so the first-launch warnings go away (needs paid certificates)
@@ -112,21 +123,14 @@ Plans, not promises. Rough order within each group; open an issue if something m
 - Copy a request as code for other languages (fetch, Python requests, ...)
 - Per-request saved response examples and a diff view
 - In-app update check
-- A **web build** (see below)
-
-**Web build (exploratory)**
-
-The UI is egui, which can run in the browser via WebAssembly, so a hosted or offline-capable web version is technically possible. It is not a drop-in compile, and it has one limit that code can't remove:
-
-- Browsers only let a page call another origin if that server sends CORS headers, and they forbid setting some headers (`Host`, `Cookie`, `Origin`, ...) and controlling redirects. A web build would fail against many APIs unless requests go through a small proxy you run, or a browser extension. The desktop app has no such limit, which is why it stays the primary target.
-- Code changes needed: replace the multi-threaded tokio runtime (it doesn't compile for `wasm32`; first error seen when trying), swap the file-based storage and the `directories` crate for `localStorage` / IndexedDB, replace file export / import / "Save body" with browser downloads and uploads, use a wasm-safe clock instead of `std::time::Instant`, and gate the native-only `reqwest` features (rustls, system proxy, custom redirect policy).
-- Deployment would add a `trunk` build and a GitHub Pages step to the release workflow.
+- An optional CORS proxy setting for the web version, an installable (offline) web app, and IndexedDB storage for it
 
 ## Develop
 
 ```bash
 cargo test            # unit + integration tests (HTTP tests use a local mock server)
 cargo clippy --all-targets
+cargo clippy --lib --bin postrust --target wasm32-unknown-unknown   # the web build
 ```
 
-Layout: `src/model.rs` (data), `vars.rs` (`{{var}}`), `http.rs` (prepare + send), `storage.rs`, `app.rs` (state and actions), `ui/` (egui views).
+Layout: `src/model.rs` (data), `vars.rs` (`{{var}}`), `http.rs` (prepare + send), `storage.rs` (shared load/save policy), `platform/` (everything that differs between desktop and browser), `app.rs` (state and actions), `ui/` (egui views), `web_entry.rs` (browser start-up).

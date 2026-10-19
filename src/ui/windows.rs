@@ -3,14 +3,22 @@ use crate::app::{App, CloseChoice};
 use crate::model::ThemeMode;
 use egui::{Context, Ui};
 
+/// The 64px logo as an egui image (decoded with the `image` crate so it works in a browser too).
+fn decode_logo() -> Option<egui::ColorImage> {
+    let png = include_bytes!("../../assets/icon-64.png");
+    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()?
+        .into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
 pub fn top_bar(app: &mut App, ui: &mut Ui) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         if app.logo.is_none()
-            && let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png"))
+            && let Some(image) = decode_logo()
         {
-            let image =
-                egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
             app.logo = Some(ui.ctx().load_texture("logo", image, egui::TextureOptions::LINEAR));
         }
         if let Some(logo) = &app.logo {
@@ -63,7 +71,10 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             if ui.button("Import / Export").clicked() {
                 app.show_io = !app.show_io;
             }
-            if ui.button(format!("Commands ({}K)", super::theme::modifier())).clicked() {
+            if ui
+                .button(format!("Commands ({}K)", super::theme::modifier(ui.ctx())))
+                .clicked()
+            {
                 super::palette::toggle(app);
             }
         });
@@ -131,17 +142,39 @@ pub fn io_window(app: &mut App, ctx: &Context) {
         .open(&mut open)
         .default_width(480.0)
         .show(ctx, |ui| {
-            ui.label("File path");
-            ui.add(egui::TextEdit::singleline(&mut app.io_path).desired_width(f32::INFINITY));
-            ui.horizontal(|ui| {
-                if ui.button("Export all collections").clicked() {
+            if app.web_mode {
+                // A browser can't read a typed file path: export downloads a file, and import
+                // takes the exported JSON pasted into a text box.
+                if ui.button("Download all collections").clicked() {
                     app.export_collections();
                 }
+                ui.add_space(6.0);
+                ui.label("To import, paste an exported file here:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.io_text)
+                        .code_editor()
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
                 if ui.button("Import (append)").clicked() {
-                    app.import_collections();
+                    app.import_pasted();
                 }
-            });
-            ui.weak("Collections are plain JSON. Secrets (tokens, passwords) are stored unencrypted.");
+                ui.weak("In the web version everything is stored in this browser, in plain text.");
+            } else {
+                ui.label("File path");
+                ui.add(egui::TextEdit::singleline(&mut app.io_path).desired_width(f32::INFINITY));
+                ui.horizontal(|ui| {
+                    if ui.button("Export all collections").clicked() {
+                        app.export_collections();
+                    }
+                    if ui.button("Import (append)").clicked() {
+                        // Path-based import is desktop-only; the web build never takes this branch.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        app.import_collections();
+                    }
+                });
+                ui.weak("Collections are plain JSON. Secrets (tokens, passwords) are stored unencrypted.");
+            }
         });
     app.show_io = open;
 }

@@ -705,3 +705,35 @@ fn importing_discards_the_stale_response_and_cancels_a_request_in_flight() {
     app.undo_import(0);
     assert!(app.tabs[0].response.is_none());
 }
+
+#[test]
+fn a_failed_paste_import_keeps_the_text_so_it_can_be_fixed_in_place() {
+    let mut app = App::new(None);
+    app.io_text = r#"{"format":"postrust-collections","collections":[{"name":"x""#.into(); // truncated
+    assert!(!app.import_pasted());
+    assert_eq!(
+        app.io_text,
+        r#"{"format":"postrust-collections","collections":[{"name":"x""#
+    );
+    assert!(app.status.as_deref().unwrap().starts_with("Import failed"));
+    assert!(app.store.collections.is_empty());
+
+    // Wrong marker is refused too, and also keeps the text.
+    app.io_text = r#"{"format":"other","collections":[]}"#.into();
+    assert!(!app.import_pasted());
+    assert!(!app.io_text.is_empty());
+
+    // Fixing it in place works, and then the box is emptied.
+    app.io_text = r#"{"format":"postrust-collections","collections":[{"name":"x","requests":[]}]}"#.into();
+    assert!(app.import_pasted());
+    assert!(app.io_text.is_empty());
+    assert_eq!(app.store.collections.len(), 1);
+    assert_eq!(app.status.as_deref(), Some("Imported 1 collection(s)"));
+}
+
+#[test]
+fn import_collections_text_reports_success_for_callers() {
+    let mut app = App::new(None);
+    assert!(!app.import_collections_text("nope"));
+    assert!(app.import_collections_text(r#"{"format":"postrust-collections","collections":[]}"#));
+}

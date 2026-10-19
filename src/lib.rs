@@ -4,6 +4,9 @@ pub mod curl;
 pub mod http;
 pub mod json;
 pub mod model;
+pub mod platform;
 pub mod storage;
 pub mod ui;
 pub mod vars;
+#[cfg(target_arch = "wasm32")]
+pub mod web_entry;

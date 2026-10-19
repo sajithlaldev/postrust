@@ -31,7 +31,7 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
         widgets::empty_state(
             ui,
             "No response yet",
-            &format!("Press Send or {}Enter", theme::modifier()),
+            &format!("Press Send or {}Enter", theme::modifier(ui.ctx())),
         );
         return false;
     };

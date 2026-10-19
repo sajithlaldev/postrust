@@ -1,8 +1,10 @@
 use crate::model::{Auth, BodyKind, Method, Request};
 use crate::vars;
 use anyhow::{Result, anyhow};
+use futures_util::StreamExt as _;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Responses larger than this are truncated (the rest is dropped while reading).
 pub const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
@@ -410,6 +412,7 @@ fn looks_like_json(s: &str) -> bool {
 
 /// Same origin for redirect purposes: same host, same port, and an http -> https upgrade
 /// is allowed (a downgrade or any other scheme change is not).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn is_cross_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
     if from.host_str() != to.host_str() {
         return true;
@@ -424,6 +427,7 @@ pub(crate) fn is_cross_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
         && to.port_or_known_default() == Some(443))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_client(guarded: bool) -> Result<reqwest::Client> {
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         // `previous()` includes the original request, so 10 redirects means len() == 11.
@@ -441,6 +445,13 @@ fn build_client(guarded: bool) -> Result<reqwest::Client> {
         .redirect(policy)
         .user_agent(concat!("postrust/", env!("CARGO_PKG_VERSION")))
         .build()?)
+}
+
+/// In a browser `fetch` does the connecting, redirecting and compression itself, so there is
+/// nothing to configure (and no way to refuse cross-origin redirects).
+#[cfg(target_arch = "wasm32")]
+fn build_client(_guarded: bool) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().build()?)
 }
 
 /// Shared HTTP clients so connection pools and TLS config are reused between requests.
@@ -494,7 +505,7 @@ async fn send_with(client: &reqwest::Client, p: Prepared, timeout: Duration) -> 
     };
 
     let start = Instant::now();
-    let mut resp = rb.send().await.map_err(describe_error)?;
+    let resp = rb.send().await.map_err(describe_error)?;
     let status = resp.status();
     let headers = resp
         .headers()
@@ -505,7 +516,9 @@ async fn send_with(client: &reqwest::Client, p: Prepared, timeout: Duration) -> 
     let mut body = Vec::new();
     let mut size = 0usize;
     let mut truncated = false;
-    while let Some(chunk) = resp.chunk().await.map_err(describe_error)? {
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| stream_error(e, start.elapsed(), timeout))?;
         size += chunk.len();
         let room = MAX_BODY_BYTES - body.len();
         if chunk.len() > room {
@@ -554,6 +567,69 @@ pub fn extension_for(content_type: Option<&str>) -> &'static str {
     }
 }
 
+/// Enabled header rows whose name satisfies `pred`, as written, once each (case-insensitive).
+fn unique_enabled_header_names(rows: &[crate::model::KeyValue], pred: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for row in rows.iter().filter(|r| r.enabled) {
+        let name = row.key.trim();
+        if pred(name) && !found.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// The Fetch spec's "forbidden header names", including any `Proxy-` or `Sec-` header.
+fn is_browser_forbidden_header(name: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "accept-charset",
+        "accept-encoding",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+    ];
+    let lower = name.to_ascii_lowercase();
+    FORBIDDEN.contains(&lower.as_str()) || lower.starts_with("proxy-") || lower.starts_with("sec-")
+}
+
+/// Request headers a browser refuses to let a page set. They are silently dropped by `fetch`, so
+/// the web UI warns about them. Names as written, once each, for enabled rows only.
+pub fn browser_forbidden_headers(rows: &[crate::model::KeyValue]) -> Vec<String> {
+    unique_enabled_header_names(rows, is_browser_forbidden_header)
+}
+
+/// Enabled header rows that look like credentials (API keys, tokens...). A browser follows
+/// redirects by itself, so on the web these could reach another site; the UI warns about them.
+pub fn credential_header_names(rows: &[crate::model::KeyValue]) -> Vec<String> {
+    unique_enabled_header_names(rows, is_sensitive_header)
+}
+
+/// The custom header the Auth tab adds (an API key), as a row, so the header checks above can
+/// cover it too. Bearer and Basic use `Authorization`, which browsers already strip on a
+/// cross-origin redirect.
+pub fn auth_header_rows(auth: &Auth) -> Vec<crate::model::KeyValue> {
+    match auth {
+        Auth::ApiKey { name, value } if !name.trim().is_empty() => vec![crate::model::KeyValue::new(name, value)],
+        _ => Vec::new(),
+    }
+}
+
 /// Credential-looking custom headers. Authorization/Cookie are excluded because reqwest
 /// already strips those itself when a redirect leaves the origin.
 fn is_sensitive_header(name: &str) -> bool {
@@ -576,6 +652,7 @@ pub fn trim_partial_utf8(body: &mut Vec<u8>) {
 }
 
 /// reqwest's Display omits the underlying cause (DNS, TLS, refused...), so walk the chain.
+#[cfg(not(target_arch = "wasm32"))]
 fn error_chain(e: &reqwest::Error) -> String {
     let mut msg = e.to_string();
     let mut src = std::error::Error::source(e);
@@ -590,6 +667,50 @@ fn error_chain(e: &reqwest::Error) -> String {
     msg
 }
 
+/// Whether a request has used up its timeout (with a little slack for scheduling).
+fn timed_out(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed + Duration::from_millis(100) >= timeout
+}
+
+/// An error while the body is streaming. The browser backend reports a timeout that fires
+/// mid-stream as an "error decoding response body", so the clock decides what to tell the user.
+fn stream_error(e: reqwest::Error, elapsed: Duration, timeout: Duration) -> anyhow::Error {
+    if timed_out(elapsed, timeout) {
+        anyhow!("Request timed out")
+    } else {
+        describe_error(e)
+    }
+}
+
+/// What the web build says when `fetch` fails. Browsers deliberately hide the reason (a CORS
+/// block looks exactly like an unreachable server), so this lists the usual causes instead of
+/// showing the useless raw JavaScript error and stack trace.
+pub fn browser_request_failed_message() -> &'static str {
+    "The browser could not complete this request. Common causes:\n\
+     - The server does not send CORS headers (Access-Control-Allow-Origin). Browsers only let a \
+     web page call other servers that allow it.\n\
+     - The address is wrong, or the server is not running.\n\
+     - This page is https but the address is http (blocked as mixed content; http://localhost is \
+     allowed).\n\
+     Browsers do not say which one it was, so check the server's CORS headers and the browser's \
+     developer console."
+}
+
+#[cfg(target_arch = "wasm32")]
+fn describe_error(e: reqwest::Error) -> anyhow::Error {
+    if e.is_timeout() {
+        anyhow!("Request timed out")
+    } else if e.is_builder() || e.is_body() || e.is_decode() {
+        // These are not the opaque network failure: keep the real cause (first line only, the
+        // browser appends a JavaScript stack trace).
+        let text = e.to_string();
+        anyhow!("{}", text.lines().next().unwrap_or("The request could not be built"))
+    } else {
+        anyhow!("{}", browser_request_failed_message())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn describe_error(e: reqwest::Error) -> anyhow::Error {
     if e.is_timeout() {
         anyhow!("Request timed out")
@@ -917,6 +1038,111 @@ mod tests {
         r.body = "{}".into();
         let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
         assert!(!curl.contains("application/json"), "user content-type wins: {curl}");
+    }
+
+    #[test]
+    fn browser_forbidden_headers_are_found_once_and_only_when_enabled() {
+        let mut off = KeyValue::new("Origin", "x");
+        off.enabled = false;
+        let rows = vec![
+            KeyValue::new("Cookie", "a=1"),
+            KeyValue::new("cookie", "b=2"),
+            KeyValue::new("Host", "example.com"),
+            KeyValue::new("Sec-Fetch-Mode", "cors"),
+            KeyValue::new("Proxy-Authorization", "x"),
+            KeyValue::new("X-Custom", "ok"),
+            KeyValue::new("Authorization", "Bearer t"),
+            KeyValue::new("User-Agent", "postrust"),
+            KeyValue::new("", "blank key"),
+            off,
+        ];
+        assert_eq!(
+            browser_forbidden_headers(&rows),
+            vec!["Cookie", "Host", "Sec-Fetch-Mode", "Proxy-Authorization"]
+        );
+        assert!(browser_forbidden_headers(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_request_that_used_its_whole_timeout_counts_as_timed_out() {
+        let t = Duration::from_secs(1);
+        assert!(!timed_out(Duration::from_millis(100), t));
+        assert!(!timed_out(Duration::from_millis(850), t));
+        assert!(
+            timed_out(Duration::from_millis(900), t),
+            "within scheduling slack of the limit"
+        );
+        assert!(timed_out(Duration::from_millis(1000), t));
+        assert!(timed_out(Duration::from_secs(5), t));
+        assert!(
+            timed_out(Duration::from_millis(0), Duration::from_millis(50)),
+            "tiny timeouts"
+        );
+    }
+
+    #[test]
+    fn the_browser_failure_message_explains_the_usual_causes_without_js_noise() {
+        let msg = browser_request_failed_message();
+        for needle in [
+            "CORS",
+            "Access-Control-Allow-Origin",
+            "mixed content",
+            "localhost",
+            "developer console",
+        ] {
+            assert!(msg.contains(needle), "{needle} missing: {msg}");
+        }
+        for noise in ["JsValue", "wasm-function", "TypeError", "at http"] {
+            assert!(!msg.contains(noise), "{noise} must not leak into the message");
+        }
+    }
+
+    #[test]
+    fn the_auth_tab_api_key_is_visible_to_the_header_checks() {
+        let key = Auth::ApiKey {
+            name: "X-Api-Key".into(),
+            value: "k".into(),
+        };
+        let rows = auth_header_rows(&key);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(credential_header_names(&rows), vec!["X-Api-Key"]);
+        assert!(browser_forbidden_headers(&rows).is_empty());
+        // An API key named like a forbidden header is caught too.
+        let cookie = Auth::ApiKey {
+            name: "Cookie".into(),
+            value: "k".into(),
+        };
+        assert_eq!(browser_forbidden_headers(&auth_header_rows(&cookie)), vec!["Cookie"]);
+        // Nothing for the other kinds (Authorization is stripped by browsers on redirects).
+        for auth in [
+            Auth::None,
+            Auth::Bearer { token: "t".into() },
+            Auth::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            Auth::ApiKey {
+                name: "  ".into(),
+                value: "k".into(),
+            },
+        ] {
+            assert!(auth_header_rows(&auth).is_empty(), "{auth:?}");
+        }
+    }
+
+    #[test]
+    fn credential_header_names_lists_enabled_credential_like_rows_once() {
+        let mut off = KeyValue::new("X-Secret", "x");
+        off.enabled = false;
+        let rows = vec![
+            KeyValue::new("X-API-Key", "k"),
+            KeyValue::new("x-api-key", "k2"),
+            KeyValue::new("X-Auth-Token", "t"),
+            KeyValue::new("Authorization", "Bearer t"),
+            KeyValue::new("X-Trace", "1"),
+            off,
+        ];
+        assert_eq!(credential_header_names(&rows), vec!["X-API-Key", "X-Auth-Token"]);
     }
 
     #[test]

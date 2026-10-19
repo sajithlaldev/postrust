@@ -109,6 +109,7 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
     let idx = app.active;
     let missing = app.missing_vars(&app.tabs[idx].request);
     let split = app.store.ui.split;
+    let web_mode = app.web_mode;
 
     let mut save_body = false;
     // Cap the response panel so the request bar (method, URL and its buttons) always keeps room,
@@ -309,7 +310,13 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
 
             match tab.req_tab {
                 ReqTab::Params => drop(kv_table(ui, "params", &mut r.params)),
-                ReqTab::Headers => drop(kv_table(ui, "headers", &mut r.headers)),
+                ReqTab::Headers => {
+                    let _ = kv_table(ui, "headers", &mut r.headers);
+                    // Browsers silently drop some headers; say so instead of letting them vanish.
+                    if web_mode {
+                        web_header_warnings(ui, &r.headers, dark);
+                    }
+                }
                 ReqTab::Body => {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut r.body_kind, BodyKind::None, "None");
@@ -349,7 +356,7 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
                         BodyKind::Form => drop(kv_table(ui, "form", &mut r.form)),
                     }
                 }
-                ReqTab::Auth => auth_editor(ui, &mut r.auth),
+                ReqTab::Auth => auth_editor(ui, &mut r.auth, web_mode, dark),
             }
         });
     });
@@ -373,7 +380,30 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
     }
 }
 
-fn auth_editor(ui: &mut Ui, auth: &mut Auth) {
+/// Web-only notes under a header table: headers the browser drops, and credential headers that
+/// a browser-followed redirect could forward to another site.
+fn web_header_warnings(ui: &mut Ui, rows: &[crate::model::KeyValue], dark: bool) {
+    let ignored = crate::http::browser_forbidden_headers(rows);
+    if !ignored.is_empty() {
+        ui.colored_label(
+            theme::warning(dark),
+            format!("The browser ignores these headers: {}", ignored.join(", ")),
+        );
+    }
+    let credentials = crate::http::credential_header_names(rows);
+    if !credentials.is_empty() {
+        ui.colored_label(theme::warning(dark), redirect_warning(&credentials));
+    }
+}
+
+fn redirect_warning(names: &[String]) -> String {
+    format!(
+        "Browsers follow redirects automatically: if the server redirects to another site, {} may be sent there too.",
+        names.join(", ")
+    )
+}
+
+fn auth_editor(ui: &mut Ui, auth: &mut Auth, web_mode: bool, dark: bool) {
     let kind = match auth {
         Auth::None => "No auth",
         Auth::Bearer { .. } => "Bearer token",
@@ -442,6 +472,18 @@ fn auth_editor(ui: &mut Ui, auth: &mut Auth) {
             ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
             ui.label("Value");
             ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+            if web_mode && !name.trim().is_empty() {
+                // An API key is a credential whatever it is called; check the name as a header too.
+                let row = [crate::model::KeyValue::new(name, value)];
+                let ignored = crate::http::browser_forbidden_headers(&row);
+                if !ignored.is_empty() {
+                    ui.colored_label(
+                        theme::warning(dark),
+                        format!("The browser ignores this header: {}", ignored.join(", ")),
+                    );
+                }
+                ui.colored_label(theme::warning(dark), redirect_warning(&[name.trim().to_string()]));
+            }
         }
     }
 }

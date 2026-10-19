@@ -1,6 +1,6 @@
 [package]
 name = "postrust"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -10,16 +10,33 @@ identifier = "dev.postrust.app"
 icon = ["assets/AppIcon.icns"]
 short_description = "A small Postman-style API client"
 
+# Shared by the desktop app and the browser (WebAssembly) build.
 [dependencies]
 anyhow = "1.0.104"
-directories = "6.0.0"
-eframe = "0.37.0"
 egui = "0.37.0"
 encoding_rs = "0.8.42"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "form", "http2", "system-proxy"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+# `std::time::Instant` panics in a browser; web-time is the std type natively.
+web-time = "1"
+
+# Desktop only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+directories = "6.0.0"
+eframe = "0.37.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "form", "http2", "system-proxy", "stream"] }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+
+# Browser only. glow (WebGL2) keeps the download smaller than wgpu and works in more browsers.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "web_screen_reader"] }
+js-sys = "0.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "stream"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Document", "Element", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlElement", "Node", "Storage", "Url", "Window"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
