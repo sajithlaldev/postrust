@@ -1,0 +1,26 @@
+[package]
+name = "postrust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata.bundle]
+name = "postrust"
+identifier = "dev.postrust.app"
+icon = ["assets/AppIcon.icns"]
+short_description = "A small Postman-style API client"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = "0.37.0"
+egui = "0.37.0"
+encoding_rs = "0.8.42"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "form", "http2", "system-proxy"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"

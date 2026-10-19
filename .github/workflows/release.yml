@@ -1,0 +1,204 @@
+name: Release
+
+# Builds and publishes a GitHub Release whenever `main` receives a push (i.e. a merged PR),
+# provided the version in Cargo.toml has not been released yet. Bump `version` in Cargo.toml
+# to cut a release; merges that don't bump it do nothing. Pull requests only run the checks.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Runs for the same ref are serialized, so two merges never publish at the same time. GitHub
+# keeps only one pending run per group; a superseded run is dropped, which is fine because the
+# surviving run releases whatever version its own (newer) commit declares.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check version
+    # Releases only ever come from main (not PRs, not manual runs on other branches).
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Could not read a valid version from Cargo.toml (got '$version')"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # ls-remote --exit-code: 0 = tag found, 2 = not found, anything else = a real failure.
+          status=0
+          git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1 || status=$?
+          case "$status" in
+            0)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "### Nothing to release" >> "$GITHUB_STEP_SUMMARY"
+              echo "Tag \`v${version}\` already exists. Bump \`version\` in Cargo.toml to publish a new release." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            2)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "### Releasing v${version}" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::Could not check for existing tag v${version} (git ls-remote exit $status)"
+              exit 1
+              ;;
+          esac
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: [check, test]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          # Cross-compiled on the ARM runner; avoids depending on Intel runner availability.
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install system libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          scripts/make-macos-app.sh "target/${{ matrix.target }}/release/postrust" "$VERSION" dist \
+            "postrust-${VERSION}-${{ matrix.name }}.dmg"
+          rm -rf dist/postrust.app
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="postrust-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/postrust" README.md logo.png "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "postrust-$env:VERSION-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/postrust.exe", "README.md", "logo.png" "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: postrust-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: postrust-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum postrust-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      # Create as a draft, upload everything, then publish. The tag only appears on publish, so
+      # a failed upload can't leave a half-released tag that blocks every later run.
+      - name: Create release
+        run: |
+          tag="v${VERSION}"
+          # Clean up a draft left behind by an earlier failed run of the same version.
+          # `release list` fails loudly on auth/network errors (unlike `view`, whose 404 is ambiguous).
+          drafts="$(gh release list --limit 200 --json tagName,isDraft \
+            --jq ".[] | select(.isDraft and .tagName == \"$tag\") | .tagName")"
+          if [ -n "$drafts" ]; then
+            gh release delete "$tag" --yes
+          fi
+          flags=()
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$tag" artifacts/* "${flags[@]}" \
+            --draft \
+            --target "${GITHUB_SHA}" \
+            --title "postrust ${tag}" \
+            --generate-notes \
+            --notes "Unsigned builds: on macOS right-click the app and choose Open the first time (or run \`xattr -dr com.apple.quarantine /Applications/postrust.app\`); on Windows choose More info, then Run anyway. Verify downloads with SHA256SUMS.txt."
+          gh release edit "$tag" --draft=false
