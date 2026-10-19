@@ -92,6 +92,35 @@ The signing job runs after the release is published; if it fails the release sta
 
 The apps are **not Apple-notarized or Windows-signed**. On macOS, right-click the app and choose Open the first time (or run `xattr -dr com.apple.quarantine /Applications/postrust.app`). On Windows, choose "More info", then "Run anyway".
 
+## Roadmap
+
+Plans, not promises. Rough order within each group; open an issue if something matters to you.
+
+**Next**
+- Import and export in the Postman v2.1 collection format
+- Native file dialogs for import, export and "Save body" (today they use a typed path / the Downloads folder)
+- `multipart/form-data` and binary / file bodies
+- Cookie jar, and proxy settings in the app
+- Search inside responses and a JSON path filter
+- Encrypt saved secrets (OS keychain) instead of plain-text `store.json`
+- Apple notarization and Windows code signing, so the first-launch warnings go away (needs paid certificates)
+
+**Later**
+- Test scripts and assertions, plus a collection runner
+- GraphQL and WebSocket requests
+- Copy a request as code for other languages (fetch, Python requests, ...)
+- Per-request saved response examples and a diff view
+- In-app update check
+- A **web build** (see below)
+
+**Web build (exploratory)**
+
+The UI is egui, which can run in the browser via WebAssembly, so a hosted or offline-capable web version is technically possible. It is not a drop-in compile, and it has one limit that code can't remove:
+
+- Browsers only let a page call another origin if that server sends CORS headers, and they forbid setting some headers (`Host`, `Cookie`, `Origin`, ...) and controlling redirects. A web build would fail against many APIs unless requests go through a small proxy you run, or a browser extension. The desktop app has no such limit, which is why it stays the primary target.
+- Code changes needed: replace the multi-threaded tokio runtime (it doesn't compile for `wasm32`; first error seen when trying), swap the file-based storage and the `directories` crate for `localStorage` / IndexedDB, replace file export / import / "Save body" with browser downloads and uploads, use a wasm-safe clock instead of `std::time::Instant`, and gate the native-only `reqwest` features (rustls, system proxy, custom redirect policy).
+- Deployment would add a `trunk` build and a GitHub Pages step to the release workflow.
+
 ## Develop
 
 ```bash
