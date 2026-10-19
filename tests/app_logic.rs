@@ -605,3 +605,103 @@ fn a_history_tab_is_clean_until_edited_and_closes_without_asking() {
     app.tabs[idx].request.body.clear();
     assert!(!app.is_tab_dirty(idx), "reverting to how it opened clears the dot");
 }
+
+const CURL_POST: &str = r#"curl 'https://api.test/users' -H 'Content-Type: application/json' -H 'Authorization: Bearer tok' -d '{"name":"ada"}' --compressed -F 'f=@x.bin'"#;
+
+#[test]
+fn importing_curl_overwrites_the_request_keeps_the_name_and_can_be_undone() {
+    let mut app = App::new(None);
+    app.tabs[0].request = Request {
+        name: "My request".into(),
+        method: Method::Delete,
+        url: "https://old.test".into(),
+        headers: vec![KeyValue::new("X-Old", "1")],
+        ..Default::default()
+    };
+    let before = app.tabs[0].request.clone();
+
+    assert!(app.import_curl(0, CURL_POST));
+    let r = &app.tabs[0].request;
+    assert_eq!(r.name, "My request", "the name is kept");
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(r.url, "https://api.test/users");
+    assert_eq!(r.body, r#"{"name":"ada"}"#);
+    assert_eq!(r.auth, Auth::Bearer { token: "tok".into() });
+    assert!(
+        r.headers.iter().all(|h| h.key != "X-Old"),
+        "the old headers are replaced, not merged"
+    );
+    let status = app.status.clone().unwrap();
+    assert!(status.starts_with("Imported cURL command"), "{status}");
+    assert!(status.contains("-F"), "ignored options are reported: {status}");
+
+    app.undo_import(0);
+    assert_eq!(app.tabs[0].request, before);
+    assert_eq!(app.status.as_deref(), Some("cURL import undone"));
+    app.undo_import(0);
+    assert_eq!(app.status.as_deref(), Some("Nothing to undo"), "undo is single use");
+}
+
+#[test]
+fn undo_import_never_discards_edits_made_after_the_import() {
+    let mut app = App::new(None);
+    assert!(app.import_curl(0, "curl https://a.test/x"));
+    app.tabs[0].request.body_kind = BodyKind::Raw;
+    app.tabs[0].request.body = "my edit".into();
+    let edited = app.tabs[0].request.clone();
+    app.undo_import(0);
+    assert_eq!(app.tabs[0].request, edited);
+    assert_eq!(app.status.as_deref(), Some("Nothing to undo"));
+}
+
+#[test]
+fn a_failed_import_changes_nothing() {
+    let mut app = App::new(None);
+    app.tabs[0].request.url = "https://keep.test".into();
+    let before = app.tabs[0].request.clone();
+    for bad in ["curl 'https://a.test", "curl", "echo hi", "curl https://a.test -H"] {
+        assert!(!app.import_curl(0, bad), "{bad}");
+        assert_eq!(app.tabs[0].request, before);
+        assert!(app.status.as_deref().unwrap().starts_with("Could not import cURL"));
+    }
+    assert!(app.tabs[0].import_undo.is_none());
+    assert!(!app.import_curl(99, "curl https://a.test"), "unknown tab");
+}
+
+#[test]
+fn an_imported_request_counts_as_unsaved_and_clears_the_beautify_undo() {
+    let mut app = App::new(None);
+    app.tabs[0].request.url = "https://a.test".into();
+    app.save_tab(0);
+    assert!(!app.is_tab_dirty(0));
+    app.tabs[0].request.body_kind = BodyKind::Raw;
+    app.tabs[0].request.body = r#"{"a":1}"#.into();
+    app.beautify_body(0);
+    assert!(app.tabs[0].beautify_undo.is_some());
+    assert!(app.import_curl(0, "curl https://b.test"));
+    assert!(app.is_tab_dirty(0), "the saved request differs from the imported one");
+    assert!(
+        app.tabs[0].beautify_undo.is_none(),
+        "the old body is gone, so its undo is too"
+    );
+}
+
+#[test]
+fn importing_discards_the_stale_response_and_cancels_a_request_in_flight() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.tabs[0].request.url = "http://127.0.0.1:1".into();
+    app.send(0, &ctx);
+    assert!(app.tabs[0].pending.is_some(), "a request is in flight");
+    assert!(app.import_curl(0, "curl https://other.test/x"));
+    assert!(app.tabs[0].pending.is_none(), "the old request was cancelled");
+    assert!(
+        app.tabs[0].response.is_none(),
+        "nothing from the old request is shown under the new one"
+    );
+
+    // The same goes for Undo: the response of the imported request is not the restored one's.
+    app.tabs[0].response = Some(Err("old".into()));
+    app.undo_import(0);
+    assert!(app.tabs[0].response.is_none());
+}

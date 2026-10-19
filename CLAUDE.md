@@ -14,6 +14,10 @@ Rust + egui (eframe 0.37) Postman-style API client. See README.md for features.
 ## Commands
 - `cargo run` / `cargo test` / `cargo clippy --all-targets`
 
+## cURL import
+- `src/curl.rs` is a pure parser (shell-style tokenizer plus option table); it never executes anything or reads files. `App::apply_import` applies a parsed command with an Undo (`App::import_curl` is the text-in convenience wrapper, used by tests). The URL field's paste interception parses once and hands the result over; it lives in `ui/request.rs` (`url_field_id` is shared with the tests).
+- `tests/curl_roundtrip.rs` checks that `http::to_curl` output parses back to the same request: keep the two in sync when changing either.
+
 ## UI structure
 - `src/ui/theme.rs` holds every colour, spacing and font decision (both themes); `widgets.rs` has the badges, pills and painted list rows; `palette.rs` is the Cmd/Ctrl+K palette. The palette's actions live in `src/commands.rs` and run through `App::run_command`.
 - Theme, split layout and panel sizes are stored in `Store.ui` (store.json), not eframe persistence.

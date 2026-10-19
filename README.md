@@ -32,7 +32,7 @@ The bundle identifier in `Cargo.toml` (`dev.postrust.app`) is a placeholder; cha
 - Request body: JSON syntax highlighting and a **Beautify JSON** button (keeps `{{variables}}` as written)
 - Postman-style layout: tabs with method badges and an unsaved-changes dot, a searchable sidebar, and the response below or beside the request (panel sizes are remembered)
 - Light, dark or system theme, coloured method badges and status pills
-- Command palette (`Cmd/Ctrl + K`) and **Copy as cURL**
+- Command palette (`Cmd/Ctrl + K`), **Copy as cURL**, and **paste a cURL command** into the URL field to fill in the whole request (with Undo)
 - Collections and request history, persisted as JSON
 - Environments with `{{variable}}` substitution (URL, params, headers, body, auth); undefined variables are highlighted
 - Multiple request tabs, cancellable requests, configurable timeout
@@ -49,6 +49,7 @@ Tokens and passwords are saved **unencrypted** (file mode 0600 on Unix). A corru
 
 - A URL without a scheme gets `https://` (`http://` for localhost / 127.0.0.1).
 - Beautify JSON and the Pretty view parse the body, so duplicate object keys collapse to the last value and string escapes are normalised (`\\u00e9` becomes `é`); use Raw (response) or don't beautify (request) if you need repeated keys.
+- Pasting a `curl ...` command into the URL field replaces the current request (its name is kept) with the parsed method, URL, headers, body and auth; an **Undo import** button appears until you edit it. Works with bash/zsh-style commands, including Chrome and Firefox "Copy as cURL" (multi-line `\` continuations and `$'...'` quoting); Windows `cmd`-style (`^`) commands aren't supported. Options postrust can't honour (multipart `-F`, `-d @file`, client certificates, ...) are listed in the status bar, and **files are never read**. `Accept-Encoding` is dropped because postrust negotiates compression itself, `Authorization: Bearer ...` moves to the Auth tab, `--json` adds its JSON headers, and `-d` data without a Content-Type gets the `application/x-www-form-urlencoded` header curl would have sent (the status bar says so). Shell variables such as `$TOKEN` become `{{TOKEN}}` placeholders for your environments, `$(...)` is never evaluated, and anything after an unquoted `|`, `&&` or `;`, plus `>` / `<` redirections, is ignored. If several `curl` commands are pasted, only the first is imported. If a command can't be parsed, the URL field is left unchanged and the status bar says why.
 - Redirects are followed (max 10). Cookies are not persisted.
 - History does not store Auth-tab credentials, but it does keep the URL and any headers you typed yourself (tokens in them are saved in plaintext).
 - Sending is refused while the URL, headers or Auth use an undefined `{{variable}}`; undefined ones in params or the body only show a warning.

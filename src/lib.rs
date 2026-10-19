@@ -1,5 +1,6 @@
 pub mod app;
 pub mod commands;
+pub mod curl;
 pub mod http;
 pub mod json;
 pub mod model;

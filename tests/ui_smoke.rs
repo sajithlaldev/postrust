@@ -649,3 +649,179 @@ fn shortcuts_pause_while_the_unsaved_changes_dialog_is_open() {
     assert_eq!(app.active, active);
     assert!(app.tabs[1].pending.is_none(), "nothing was sent behind the dialog");
 }
+
+fn focus_url(app: &mut App, ctx: &egui::Context) {
+    let id = postrust::ui::url_field_id(app.tabs[app.active].id);
+    ctx.memory_mut(|m| m.request_focus(id));
+    frames(app, ctx, 2);
+}
+
+fn paste(app: &mut App, ctx: &egui::Context, text: &str) {
+    frame(app, ctx, raw(vec![Event::Paste(text.to_string())]));
+    frames(app, ctx, 2);
+}
+
+#[test]
+fn pasting_a_curl_command_into_the_url_field_fills_the_request() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.tabs[0].request.name = "Keep me".into();
+    frames(&mut app, &ctx, 2);
+    focus_url(&mut app, &ctx);
+
+    paste(
+        &mut app,
+        &ctx,
+        "curl -X POST 'https://api.test/users?x=1' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"name\":\"ada\"}'",
+    );
+    let r = &app.tabs[0].request;
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.url, "https://api.test/users?x=1",
+        "the raw command was not typed into the field"
+    );
+    assert_eq!(r.body, r#"{"name":"ada"}"#);
+    assert_eq!(r.name, "Keep me");
+    assert!(app.status.as_deref().unwrap().starts_with("Imported cURL command"));
+    assert!(app.tabs[0].import_undo.is_some());
+
+    // The Undo button is rendered while the request is untouched, and Undo works.
+    frames(&mut app, &ctx, 2);
+    app.undo_import(0);
+    assert_eq!(app.tabs[0].request.url, "");
+    frames(&mut app, &ctx, 2);
+}
+
+#[test]
+fn only_curl_commands_pasted_into_the_focused_url_field_are_intercepted() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    frames(&mut app, &ctx, 2);
+
+    // Not focused: a pasted command is left alone (nothing imports it).
+    paste(&mut app, &ctx, "curl https://a.test/unfocused");
+    assert!(app.tabs[0].import_undo.is_none());
+    assert_eq!(app.tabs[0].request.url, "");
+
+    // Focused, but not a curl command: ordinary paste.
+    focus_url(&mut app, &ctx);
+    paste(&mut app, &ctx, "https://a.test/plain");
+    assert_eq!(app.tabs[0].request.url, "https://a.test/plain");
+    assert!(app.tabs[0].import_undo.is_none());
+
+    // Text that merely contains "curl" is not a command either.
+    paste(&mut app, &ctx, "/curl https://x");
+    assert_eq!(app.tabs[0].request.url, "https://a.test/plain/curl https://x");
+    assert!(app.tabs[0].import_undo.is_none());
+}
+
+#[test]
+fn an_unparseable_curl_paste_leaves_the_url_field_untouched_and_says_why() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.tabs[0].request.url = "https://keep.test".into();
+    frames(&mut app, &ctx, 2);
+    focus_url(&mut app, &ctx);
+    paste(&mut app, &ctx, "curl 'https://a.test/unterminated\n  -H 'x: y'");
+    assert!(app.tabs[0].import_undo.is_none(), "nothing was imported");
+    assert_eq!(
+        app.tabs[0].request.url, "https://keep.test",
+        "a long broken command is not dumped into the one-line field"
+    );
+    let status = app.status.clone().unwrap();
+    assert!(
+        status.contains("Could not import cURL") && status.contains("left unchanged"),
+        "{status}"
+    );
+}
+
+#[test]
+fn a_second_import_replaces_the_first_and_undo_goes_back_one_step() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    frames(&mut app, &ctx, 2);
+    focus_url(&mut app, &ctx);
+    paste(&mut app, &ctx, "curl https://one.test");
+    assert_eq!(app.tabs[0].request.url, "https://one.test");
+    paste(&mut app, &ctx, "curl -X DELETE https://two.test");
+    assert_eq!(app.tabs[0].request.url, "https://two.test");
+    assert_eq!(app.tabs[0].request.method, Method::Delete);
+    app.undo_import(0);
+    assert_eq!(app.tabs[0].request.url, "https://one.test");
+}
+
+/// Vertical centres of every text shape in one frame, keyed by the text.
+fn text_centres(app: &mut App, ctx: &egui::Context) -> Vec<(String, f32)> {
+    fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => {
+                out.push((t.galley.text().to_string(), t.pos.y + t.galley.rect.center().y));
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut output = ctx.run_ui(raw(vec![]), |ui| postrust::ui::draw(app, ui));
+    let mut found = Vec::new();
+    for clipped in std::mem::take(&mut output.shapes) {
+        walk(&clipped.shape, &mut found);
+    }
+    output.drop_without_applying_deltas();
+    found
+}
+
+#[test]
+fn request_bar_text_is_vertically_centred_with_its_neighbours() {
+    for theme in [ThemeMode::Dark, ThemeMode::Light] {
+        let ctx = egui::Context::default();
+        let mut app = App::new(None);
+        app.store.ui.theme = theme;
+        frames(&mut app, &ctx, 3);
+        let texts = text_centres(&mut app, &ctx);
+        let centre_of = |starts: &str| {
+            texts
+                .iter()
+                .find(|(t, _)| t.starts_with(starts))
+                .map(|(_, y)| *y)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no text starting with {starts:?} among {:?}",
+                        texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                    )
+                })
+        };
+        let url = centre_of("https://api.example.com");
+        let send = centre_of("Send");
+        // Both the tab badge and the method box say "GET"; the one on the request bar's row is
+        // the one nearest to the Send button.
+        let method = texts
+            .iter()
+            .filter(|(t, _)| t == "GET")
+            .map(|(_, y)| *y)
+            .min_by(|a, b| (a - send).abs().total_cmp(&(b - send).abs()))
+            .expect("a GET label");
+        assert!(
+            (url - send).abs() <= 2.0,
+            "{theme:?}: URL text centre {url} vs Send {send}"
+        );
+        assert!(
+            (url - method).abs() <= 2.0,
+            "{theme:?}: URL text centre {url} vs GET {method}"
+        );
+
+        // The same must hold once the user has typed something (real text, not the hint).
+        app.tabs[0].request.url = "https://typed.example.com/path".into();
+        frames(&mut app, &ctx, 2);
+        let texts = text_centres(&mut app, &ctx);
+        let typed = texts
+            .iter()
+            .find(|(t, _)| t.starts_with("https://typed"))
+            .map(|(_, y)| *y)
+            .unwrap();
+        let send = texts.iter().find(|(t, _)| t == "Send").map(|(_, y)| *y).unwrap();
+        assert!(
+            (typed - send).abs() <= 2.0,
+            "{theme:?}: typed URL centre {typed} vs Send {send}"
+        );
+    }
+}

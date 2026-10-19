@@ -5,12 +5,22 @@ use egui::{Color32, Context, CornerRadius, Frame, Margin, RichText, Sense, Strok
 
 #[derive(PartialEq)]
 enum Action {
+    /// A `curl ...` command was pasted into the URL field.
+    ImportCurl(Box<crate::curl::Imported>),
+    UndoImport,
+    /// Show a message in the status bar.
+    Status(String),
     UndoBeautify,
     Send,
     Cancel,
     Save,
     Curl,
     Beautify,
+}
+
+/// Stable widget id of a tab's URL field (tests and the paste handler both need it).
+pub fn url_field_id(tab_id: u64) -> egui::Id {
+    egui::Id::unique(("url_edit", tab_id))
 }
 
 pub fn tab_bar(app: &mut App, ui: &mut Ui) {
@@ -195,11 +205,44 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
                                 }
                             });
                         let w = (ui.available_width() - 250.0).max(120.0);
+                        let url_id = url_field_id(tab.id);
+                        // Pasting a `curl ...` command into the URL field fills in the whole
+                        // request. The paste event is removed so the raw text isn't also typed in.
+                        if ui.memory(|m| m.has_focus(url_id)) {
+                            let pasted = ui.input(|i| {
+                                i.events.iter().find_map(|e| match e {
+                                    egui::Event::Paste(t) if crate::curl::looks_like_curl(t) => Some(t.clone()),
+                                    _ => None,
+                                })
+                            });
+                            if let Some(text) = pasted {
+                                match crate::curl::parse(&text) {
+                                    Ok(imported) => {
+                                        ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                                        action = Some(Action::ImportCurl(Box::new(imported)));
+                                    }
+                                    // Unparseable: don't dump a long multi-line command into the one-line
+                                    // field; keep it as it was and say why. The text is still on the
+                                    // clipboard.
+                                    Err(e) => {
+                                        ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                                        action = Some(Action::Status(format!(
+                                            "Could not import cURL: {e} (the URL field was left unchanged)"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                         ui.add(
                             egui::TextEdit::singleline(&mut r.url)
+                                .id(url_id)
                                 .hint_text("https://api.example.com/resource  ({{variables}} work here)")
                                 .font(egui::TextStyle::Monospace)
                                 .frame(Frame::NONE)
+                                // Same height as the buttons beside it, with the text centred in
+                                // that height (it was drawn at the top of the taller box).
+                                .min_size(vec2(0.0, 28.0))
+                                .align(egui::Align2::LEFT_CENTER)
                                 .desired_width(w),
                         );
                         if tab.pending.is_some() {
@@ -227,6 +270,24 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
                         }
                     });
                 });
+            // Undo only while the request is still exactly what the import produced; once it has
+            // been edited the saved copies are dropped. (While untouched this is one equality
+            // check per frame, which stops at the first difference or is a fast memcmp.)
+            if tab.import_undo.as_ref().is_some_and(|(_, after)| after != &*r) {
+                tab.import_undo = None;
+            }
+            if tab.import_undo.is_some() {
+                ui.horizontal(|ui| {
+                    ui.weak("Filled in from a cURL command.");
+                    if ui
+                        .button("Undo import")
+                        .on_hover_text("Restore the request from before the paste")
+                        .clicked()
+                    {
+                        action = Some(Action::UndoImport);
+                    }
+                });
+            }
             if !missing.is_empty() {
                 ui.colored_label(
                     theme::warning(dark),
@@ -303,6 +364,11 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
         Some(Action::Curl) => app.copy_curl(idx, ctx),
         Some(Action::Beautify) => app.beautify_body(idx),
         Some(Action::UndoBeautify) => app.undo_beautify(idx),
+        Some(Action::ImportCurl(imported)) => {
+            app.apply_import(idx, *imported);
+        }
+        Some(Action::UndoImport) => app.undo_import(idx),
+        Some(Action::Status(msg)) => app.status = Some(msg),
         None => {}
     }
 }

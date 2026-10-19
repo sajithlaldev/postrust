@@ -62,6 +62,9 @@ pub struct Tab {
     /// `(body before, body after)` of the last Beautify, so it can be undone while the body is
     /// still exactly what Beautify produced.
     pub beautify_undo: Option<(String, String)>,
+    /// `(request before, request after)` of the last cURL import, so it can be undone while the
+    /// request is still exactly what the import produced.
+    pub import_undo: Option<(Request, Request)>,
 }
 
 /// What to do with a tab that has unsaved changes when the user closes it.
@@ -70,6 +73,17 @@ pub enum CloseChoice {
     Save,
     Discard,
     Cancel,
+}
+
+impl Tab {
+    /// Cancels a request in flight and forgets the last response (it no longer matches the
+    /// request in the tab).
+    pub fn discard_response(&mut self) {
+        if let Some(p) = self.pending.take() {
+            p.handle.abort();
+        }
+        self.response = None;
+    }
 }
 
 impl Drop for Tab {
@@ -226,6 +240,53 @@ impl App {
         self.status = Some(msg);
     }
 
+    /// Replaces the tab's request with the parsed `curl` command (keeping the request name) and
+    /// remembers the old one for `undo_import`. Returns false, changing nothing, if the text
+    /// can't be parsed.
+    pub fn import_curl(&mut self, idx: usize, text: &str) -> bool {
+        match crate::curl::parse(text) {
+            Ok(imported) => self.apply_import(idx, imported),
+            Err(e) => {
+                self.status = Some(format!("Could not import cURL: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Applies an already-parsed import (see `import_curl`).
+    pub fn apply_import(&mut self, idx: usize, imported: crate::curl::Imported) -> bool {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return false;
+        };
+        let mut request = imported.request;
+        request.name = tab.request.name.clone();
+        let before = std::mem::replace(&mut tab.request, request);
+        tab.import_undo = Some((before, tab.request.clone()));
+        tab.beautify_undo = None;
+        // A response (or one still on its way) belongs to the request that was just replaced.
+        tab.discard_response();
+        let mut msg = String::from("Imported cURL command");
+        if !imported.warnings.is_empty() {
+            msg.push_str(". Note: ");
+            msg.push_str(&imported.warnings.join("; "));
+        }
+        self.status = Some(msg);
+        true
+    }
+
+    /// Restores the request from before the last cURL import, unless it was edited since.
+    pub fn undo_import(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        self.status = Some(match tab.import_undo.take() {
+            Some((before, after)) if tab.request == after => {
+                tab.request = before;
+                tab.discard_response();
+                "cURL import undone".to_string()
+            }
+            _ => "Nothing to undo".to_string(),
+        });
+    }
+
     /// Restores the body from before the last Beautify, unless the user has edited it since.
     pub fn undo_beautify(&mut self, idx: usize) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
@@ -311,6 +372,7 @@ impl App {
             resp_tab: RespTab::Body,
             pretty: true,
             beautify_undo: None,
+            import_undo: None,
         };
         self.next_id += 1;
         self.tabs.push(tab);
