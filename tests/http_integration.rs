@@ -30,7 +30,11 @@ async fn get_with_query_and_bearer() {
     req.auth = Auth::Bearer { token: "tok".into() };
     let resp = run(&req, &no_vars()).await.unwrap();
     assert_eq!(resp.status, 200);
-    assert!(resp.pretty_text().contains("\"ok\": true"));
+    assert!(
+        postrust::http::pretty_json(&resp.text())
+            .unwrap()
+            .contains("\"ok\": true")
+    );
 }
 
 #[tokio::test]

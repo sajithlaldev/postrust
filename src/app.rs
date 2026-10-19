@@ -1,5 +1,6 @@
-use crate::http::{self, ResponseData};
-use crate::model::{Auth, Collection, Environment, Request, Store};
+use crate::commands::Command;
+use crate::http::{self, ResponseData, pretty_json};
+use crate::model::{Auth, BodyKind, Collection, Environment, Request, SplitLayout, Store, ThemeMode};
 use crate::storage::{self, Storage};
 use crate::{ui, vars};
 use std::sync::{Arc, mpsc};
@@ -17,6 +18,10 @@ pub struct Resp {
     /// Pretty-printed text computed once on arrival (empty for binary bodies).
     pub display: String,
     pub display_cut: bool,
+    /// The body parsed as JSON (so the viewer highlights it and offers Pretty/Raw).
+    pub is_json: bool,
+    /// Unformatted text for the Raw view; only filled when `is_json` (otherwise equals `display`).
+    pub raw: String,
 }
 
 pub type Outcome = Result<Resp, String>;
@@ -49,6 +54,22 @@ pub struct Tab {
     pub pending: Option<Pending>,
     pub req_tab: ReqTab,
     pub resp_tab: RespTab,
+    /// Show pretty-printed JSON (true) or the body exactly as received (false).
+    pub pretty: bool,
+    /// What the request looked like when the tab was opened. A tab that is not linked to a saved
+    /// request (e.g. opened from History) is "unsaved" only if it differs from this.
+    pub baseline: Request,
+    /// `(body before, body after)` of the last Beautify, so it can be undone while the body is
+    /// still exactly what Beautify produced.
+    pub beautify_undo: Option<(String, String)>,
+}
+
+/// What to do with a tab that has unsaved changes when the user closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 impl Drop for Tab {
@@ -57,6 +78,16 @@ impl Drop for Tab {
             p.handle.abort();
         }
     }
+}
+
+/// State of the Cmd/Ctrl+K command palette while it is open.
+#[derive(Default)]
+pub struct PaletteState {
+    pub query: String,
+    pub selected: usize,
+    /// Set after the search box took focus once, so later frames don't pull focus back from
+    /// whatever the user clicked.
+    pub focused: bool,
 }
 
 pub enum RenameTarget {
@@ -82,6 +113,16 @@ pub struct App {
     pub status: Option<String>,
     /// Top-bar logo texture, loaded on first draw.
     pub logo: Option<egui::TextureHandle>,
+    pub palette: Option<PaletteState>,
+    /// Sidebar filter text.
+    pub search: String,
+    pub adding_collection: bool,
+    /// Id of a tab with unsaved changes the user asked to close and has to confirm.
+    pub confirm_close: Option<u64>,
+    /// One-shot: focus the new-collection box on the next frame.
+    pub focus_new_collection: bool,
+    /// Theme currently applied to egui; `None` until the first frame.
+    pub applied_theme: Option<ThemeMode>,
 }
 
 impl App {
@@ -111,6 +152,12 @@ impl App {
             new_collection: String::new(),
             status: None,
             logo: None,
+            palette: None,
+            search: String::new(),
+            adding_collection: false,
+            confirm_close: None,
+            focus_new_collection: false,
+            applied_theme: None,
         };
         app.new_tab(Request::default(), None);
         if load_notice.is_some() {
@@ -121,6 +168,133 @@ impl App {
         app
     }
 
+    /// True when the tab holds changes that are not in its saved request (or, for a tab that is
+    /// not linked to one, anything that differs from how it was opened).
+    pub fn is_tab_dirty(&self, idx: usize) -> bool {
+        let Some(tab) = self.tabs.get(idx) else { return false };
+        match tab
+            .source
+            .and_then(|(c, r)| self.store.collections.get(c).and_then(|c| c.requests.get(r)))
+        {
+            Some(saved) => *saved != tab.request,
+            None => tab.request != tab.baseline,
+        }
+    }
+
+    pub fn set_theme(&mut self, mode: ThemeMode) {
+        if self.store.ui.theme != mode {
+            self.store.ui.theme = mode;
+            self.dirty = true;
+        }
+    }
+
+    pub fn toggle_split(&mut self) {
+        self.store.ui.split = self.store.ui.split.toggled();
+        self.dirty = true;
+    }
+
+    /// Remembers a panel size once the user stops dragging (`size` changes while dragging).
+    pub fn remember_sidebar_width(&mut self, width: f32) {
+        remember(&mut self.store.ui.sidebar_width, width, &mut self.dirty);
+    }
+
+    pub fn remember_response_size(&mut self, split: SplitLayout, size: f32) {
+        let slot = match split {
+            SplitLayout::Below => &mut self.store.ui.response_height,
+            SplitLayout::Side => &mut self.store.ui.response_width,
+        };
+        remember(slot, size, &mut self.dirty);
+    }
+
+    /// Pretty-prints the active tab's raw JSON body (keeping `{{variables}}`).
+    pub fn beautify_body(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        let msg = if tab.request.body_kind != BodyKind::Raw {
+            "Switch the body to Raw to beautify it".to_string()
+        } else if tab.request.body.trim().is_empty() {
+            "Nothing to beautify: the body is empty".to_string()
+        } else {
+            match crate::json::beautify(&tab.request.body) {
+                Ok(pretty) => {
+                    let before = std::mem::replace(&mut tab.request.body, pretty.clone());
+                    tab.beautify_undo = Some((before, pretty));
+                    "Body beautified (Undo is available next to the button)".to_string()
+                }
+                Err(e) => format!("Cannot beautify: not valid JSON ({e})"),
+            }
+        };
+        self.status = Some(msg);
+    }
+
+    /// Restores the body from before the last Beautify, unless the user has edited it since.
+    pub fn undo_beautify(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        self.status = Some(match tab.beautify_undo.take() {
+            Some((before, after)) if tab.request.body == after => {
+                tab.request.body = before;
+                "Beautify undone".to_string()
+            }
+            _ => "Nothing to undo".to_string(),
+        });
+    }
+
+    /// Closes the tab, or asks first when it has unsaved changes (see `resolve_close`).
+    pub fn request_close_tab(&mut self, idx: usize) {
+        if self.is_tab_dirty(idx) {
+            self.confirm_close = self.tabs.get(idx).map(|t| t.id);
+        } else {
+            self.close_tab(idx);
+        }
+    }
+
+    /// Applies the user's answer to the pending close confirmation.
+    pub fn resolve_close(&mut self, choice: CloseChoice) {
+        let Some(id) = self.confirm_close.take() else { return };
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        match choice {
+            CloseChoice::Save => {
+                self.save_tab(idx);
+                self.close_tab(idx);
+            }
+            CloseChoice::Discard => self.close_tab(idx),
+            CloseChoice::Cancel => {}
+        }
+    }
+
+    /// Copies the tab's request as a `curl` command (variables resolved).
+    pub fn copy_curl(&mut self, idx: usize, ctx: &egui::Context) {
+        let map = vars::to_map(self.store.active_vars());
+        let Some(tab) = self.tabs.get(idx) else { return };
+        self.status = Some(match http::prepare(&tab.request, &map) {
+            Ok(prepared) => {
+                ctx.copy_text(http::to_curl(&prepared));
+                "Copied cURL command to the clipboard".to_string()
+            }
+            Err(e) => format!("Cannot build cURL: {e:#}"),
+        });
+    }
+
+    pub fn run_command(&mut self, command: Command, ctx: &egui::Context) {
+        let idx = self.active;
+        match command {
+            Command::Send => self.send(idx, ctx),
+            Command::Save => self.save_tab(idx),
+            Command::NewTab => self.new_tab(Request::default(), None),
+            Command::CloseTab => self.request_close_tab(idx),
+            Command::CopyCurl => self.copy_curl(idx, ctx),
+            Command::BeautifyBody => self.beautify_body(idx),
+            Command::CycleTheme => {
+                let next = self.store.ui.theme.next();
+                self.set_theme(next);
+            }
+            Command::ToggleSplit => self.toggle_split(),
+            Command::ManageEnvironments => self.show_env = true,
+            Command::ImportExport => self.show_io = true,
+        }
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
@@ -128,12 +302,15 @@ impl App {
     pub fn new_tab(&mut self, request: Request, source: Option<(usize, usize)>) {
         let tab = Tab {
             id: self.next_id,
+            baseline: request.clone(),
             request,
             source,
             response: None,
             pending: None,
             req_tab: ReqTab::Params,
             resp_tab: RespTab::Body,
+            pretty: true,
+            beautify_undo: None,
         };
         self.next_id += 1;
         self.tabs.push(tab);
@@ -472,11 +649,38 @@ fn write_new_file(dir: &std::path::Path, stem: &str, ext: &str, bytes: &[u8]) ->
     ))
 }
 
+/// Stores `value` in `slot` if it moved by more than a pixel (avoids rewriting the file for
+/// sub-pixel layout noise).
+fn remember(slot: &mut Option<f32>, value: f32, dirty: &mut bool) {
+    if value.is_finite() && value > 0.0 && slot.is_none_or(|old| (old - value).abs() > 1.0) {
+        *slot = Some(value);
+        *dirty = true;
+    }
+}
+
 fn default_export_path() -> String {
     directories::UserDirs::new()
         .and_then(|d| d.download_dir().map(|p| p.join("postrust-collections.json")))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "postrust-collections.json".into())
+}
+
+/// Cuts `s` to at most `limit` bytes on a char boundary; true if anything was removed.
+fn truncate_at_boundary(s: &mut String, limit: usize) -> bool {
+    if s.len() <= limit {
+        return false;
+    }
+    let mut end = limit;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    true
+}
+
+/// True if the first non-space byte opens a JSON object/array (cheap, no parsing).
+fn starts_like_json(text: &str) -> bool {
+    matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['))
 }
 
 fn into_resp(data: ResponseData) -> Resp {
@@ -487,28 +691,43 @@ fn into_resp(data: ResponseData) -> Resp {
             is_text,
             display: String::new(),
             display_cut: false,
+            is_json: false,
+            raw: String::new(),
         };
     }
-    // Pretty-printing parses and re-serializes the whole body; skip it for very large ones.
-    let mut display = if data.body.len() <= PRETTY_LIMIT {
-        data.pretty_text()
-    } else {
-        data.text()
-    };
+    let mut text = data.text();
     let mut cut = data.truncated;
-    if display.len() > DISPLAY_LIMIT {
-        let mut end = DISPLAY_LIMIT;
-        while !display.is_char_boundary(end) {
-            end -= 1;
+    // Pretty-printing parses and re-serializes the whole body; skip it for very large ones,
+    // which are still highlighted (cheap check) but shown exactly as received.
+    let pretty = if data.body.len() <= PRETTY_LIMIT {
+        pretty_json(&text)
+    } else {
+        None
+    };
+    let (display, raw, is_json) = match pretty {
+        Some(mut pretty) => {
+            cut |= truncate_at_boundary(&mut pretty, DISPLAY_LIMIT);
+            cut |= truncate_at_boundary(&mut text, DISPLAY_LIMIT);
+            (pretty, text, true)
         }
-        display.truncate(end);
-        cut = true;
-    }
+        None => {
+            // Without a parse, trust a JSON Content-Type plus a leading `{`/`[` (so `[INFO] ...`
+            // in a text/plain log is not coloured as JSON).
+            let json_type = data
+                .content_type()
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"));
+            let is_json = json_type && starts_like_json(&text);
+            cut |= truncate_at_boundary(&mut text, DISPLAY_LIMIT);
+            (text, String::new(), is_json)
+        }
+    };
     Resp {
         data,
         is_text,
         display,
         display_cut: cut,
+        is_json,
+        raw,
     }
 }
 
@@ -520,5 +739,106 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui::draw(self, ui);
         self.persist();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(content_type: &str, body: &[u8], truncated: bool) -> ResponseData {
+        ResponseData {
+            status: 200,
+            reason: "OK".into(),
+            elapsed_ms: 1,
+            size: body.len(),
+            truncated,
+            headers: vec![("content-type".into(), content_type.into())],
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn small_json_is_pretty_with_a_separate_raw_view() {
+        let r = into_resp(response("application/json", br#"{"b":1,"a":[1,2]}"#, false));
+        assert!(r.is_json && r.is_text);
+        assert!(r.display.contains("\n  \"b\": 1"));
+        assert_eq!(r.raw, r#"{"b":1,"a":[1,2]}"#);
+        assert!(!r.display_cut);
+    }
+
+    #[test]
+    fn non_json_text_has_no_raw_copy_or_highlighting() {
+        let r = into_resp(response("text/html", b"<html>{\"a\":1}</html>", false));
+        assert!(!r.is_json);
+        assert!(r.raw.is_empty());
+        assert_eq!(r.display, "<html>{\"a\":1}</html>");
+    }
+
+    #[test]
+    fn invalid_json_that_looks_like_json_is_highlighted_but_not_reformatted() {
+        let r = into_resp(response("application/json", b"{\"a\": ", false));
+        assert!(r.is_json);
+        assert!(r.raw.is_empty(), "no Pretty/Raw toggle without a pretty version");
+        assert_eq!(r.display, "{\"a\": ");
+    }
+
+    #[test]
+    fn huge_json_skips_pretty_printing_but_keeps_highlighting() {
+        let body = format!("[{}0]", "0,".repeat(PRETTY_LIMIT / 2 + 10));
+        let r = into_resp(response("application/json", body.as_bytes(), false));
+        assert!(r.is_json);
+        assert!(r.raw.is_empty());
+        assert!(r.display_cut);
+        assert!(r.display.len() <= DISPLAY_LIMIT);
+        assert!(r.display.starts_with("[0,0,"), "shown as received, not re-formatted");
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        let body = "é".repeat(DISPLAY_LIMIT); // 2 bytes each, so the cut falls mid-way for odd limits
+        let mut s = body.clone();
+        assert!(truncate_at_boundary(&mut s, DISPLAY_LIMIT - 1));
+        assert!(s.len() < DISPLAY_LIMIT);
+        assert!(s.chars().all(|c| c == 'é'));
+        let mut short = "abc".to_string();
+        assert!(!truncate_at_boundary(&mut short, 10));
+    }
+
+    #[test]
+    fn binary_bodies_have_no_text_views() {
+        let r = into_resp(response("application/octet-stream", &[0xff, 0xfe, 0x00], false));
+        assert!(!r.is_text && !r.is_json);
+        assert!(r.display.is_empty() && r.raw.is_empty());
+    }
+
+    #[test]
+    fn json_looking_plain_text_and_scalars_are_not_json() {
+        for (ct, body) in [
+            ("text/plain", &b"[INFO] started"[..]),
+            ("text/plain", b"42"),
+            ("text/plain", b"true"),
+        ] {
+            let r = into_resp(response(ct, body, false));
+            assert!(!r.is_json, "{body:?}");
+            assert!(r.raw.is_empty());
+        }
+        // A genuinely valid object is JSON whatever the Content-Type says.
+        assert!(into_resp(response("text/plain", br#"{"a":1}"#, false)).is_json);
+    }
+
+    #[test]
+    fn raw_view_cut_is_reported_too() {
+        let big = format!("[{}0]", "1,".repeat(DISPLAY_LIMIT)); // pretty is much bigger than raw
+        let r = into_resp(response("application/json", big.as_bytes(), false));
+        assert!(r.is_json && !r.raw.is_empty());
+        assert!(r.display_cut);
+        assert!(r.raw.len() <= DISPLAY_LIMIT);
+    }
+
+    #[test]
+    fn truncated_downloads_are_flagged() {
+        let r = into_resp(response("text/plain", b"hello", true));
+        assert!(r.display_cut);
     }
 }

@@ -1,7 +1,8 @@
 use crate::model::KeyValue;
 use std::collections::HashMap;
 
-fn valid_name(n: &str) -> bool {
+/// A variable name: non-empty, letters/digits/`_`/`-`/`.` only (after trimming).
+pub fn valid_name(n: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 

@@ -1,14 +1,6 @@
+use super::{theme, widgets};
 use crate::app::{RespTab, Tab};
-use egui::{Color32, RichText, Ui};
-
-fn status_color(code: u16) -> Color32 {
-    match code {
-        200..=299 => Color32::from_rgb(60, 170, 90),
-        300..=399 => Color32::from_rgb(70, 140, 220),
-        400..=499 => Color32::from_rgb(220, 140, 40),
-        _ => Color32::from_rgb(210, 70, 70),
-    }
-}
+use egui::{RichText, Ui};
 
 fn human_size(n: usize) -> String {
     const KB: f64 = 1024.0;
@@ -25,21 +17,30 @@ fn human_size(n: usize) -> String {
 /// Draws the response area. Returns true when the user asked to save the body.
 pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
     let mut save = false;
+    let dark = ui.visuals().dark_mode;
     ui.add_space(4.0);
     if tab.pending.is_some() {
-        ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
             ui.spinner();
-            ui.label("Sending request…");
+            ui.label("Sending request...");
         });
         return false;
     }
     let Some(outcome) = &tab.response else {
-        ui.weak("Hit Send to get a response.");
+        widgets::empty_state(
+            ui,
+            "No response yet",
+            &format!("Press Send or {}Enter", theme::modifier()),
+        );
         return false;
     };
     let resp = match outcome {
         Err(e) => {
-            ui.colored_label(Color32::from_rgb(210, 70, 70), RichText::new(e).strong());
+            ui.add_space(8.0);
+            widgets::pill(ui, "Request failed", theme::error(dark));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(e).color(theme::error(dark))).wrap());
             return false;
         }
         Ok(r) => r,
@@ -47,9 +48,10 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
     let d = &resp.data;
 
     ui.horizontal(|ui| {
-        ui.colored_label(
-            status_color(d.status),
-            RichText::new(format!("{} {}", d.status, d.reason)).strong(),
+        widgets::pill(
+            ui,
+            format!("{} {}", d.status, d.reason).trim().to_string(),
+            theme::status_color(d.status, dark),
         );
         ui.label(format!("{} ms", d.elapsed_ms));
         ui.label(human_size(d.size));
@@ -61,8 +63,11 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
                 save = true;
             }
             if resp.is_text && ui.button("Copy").clicked() {
-                // The viewer text is truncated for big bodies; copy the whole downloaded text instead.
-                ui.ctx().copy_text(if resp.display_cut {
+                // Copy what the user is looking at: the pretty text, or the body exactly as received
+                // (Raw view). The viewer text is truncated for big bodies, so copy the whole
+                // downloaded text instead whenever the view was cut or Raw is selected.
+                let raw_view = !tab.pretty && !resp.raw.is_empty();
+                ui.ctx().copy_text(if raw_view || resp.display_cut {
                     resp.data.text()
                 } else {
                     resp.display.clone()
@@ -77,6 +82,12 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
             RespTab::Headers,
             format!("Headers ({})", d.headers.len()),
         );
+        if !resp.raw.is_empty() && tab.resp_tab == RespTab::Body {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(&mut tab.pretty, false, "Raw");
+                ui.selectable_value(&mut tab.pretty, true, "Pretty");
+            });
+        }
     });
     ui.separator();
 
@@ -84,15 +95,15 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
         RespTab::Body => {
             if d.truncated || resp.display_cut {
                 ui.colored_label(
-                    Color32::from_rgb(220, 140, 40),
-                    "Body is too large to show in full. Use “Save body” for the downloaded part.",
+                    theme::warning(dark),
+                    "Body is too large to show in full. Use \"Save body\" for the downloaded part.",
                 );
             }
             if d.body.is_empty() {
                 ui.weak("Empty body.");
             } else if !resp.is_text {
                 ui.label(format!(
-                    "Binary body ({}). Use “Save body” to write it to a file.",
+                    "Binary body ({}). Use \"Save body\" to write it to a file.",
                     human_size(d.size)
                 ));
             } else {
@@ -100,13 +111,20 @@ pub fn draw(ui: &mut Ui, tab: &mut Tab) -> bool {
                     .id_salt("resp_body")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let mut text: &str = &resp.display;
-                        ui.add(
-                            egui::TextEdit::multiline(&mut text)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(8),
-                        );
+                        let mut text: &str = if tab.pretty || resp.raw.is_empty() {
+                            &resp.display
+                        } else {
+                            &resp.raw
+                        };
+                        let mut layouter = super::json::layouter();
+                        let mut edit = egui::TextEdit::multiline(&mut text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(8);
+                        if resp.is_json {
+                            edit = edit.layouter(&mut layouter);
+                        }
+                        ui.add(edit);
                     });
             }
         }

@@ -2,7 +2,7 @@
   <img src="logo.png" alt="postrust logo" width="160">
 </p>
 
-# postrust
+# PostRust
 
 A small Postman-style API client written in Rust with [egui](https://github.com/emilk/egui).
 
@@ -28,13 +28,17 @@ The bundle identifier in `Cargo.toml` (`dev.postrust.app`) is a placeholder; cha
 ## Features
 
 - Request builder: method, URL, query params, headers, body (raw / urlencoded form), auth (Bearer, Basic, API key header)
-- Response viewer: status, time, size, pretty-printed JSON, headers, copy / save body
+- Response viewer: status, time, size, syntax-highlighted pretty-printed JSON (with a Pretty / Raw toggle), headers, copy / save body
+- Request body: JSON syntax highlighting and a **Beautify JSON** button (keeps `{{variables}}` as written)
+- Postman-style layout: tabs with method badges and an unsaved-changes dot, a searchable sidebar, and the response below or beside the request (panel sizes are remembered)
+- Light, dark or system theme, coloured method badges and status pills
+- Command palette (`Cmd/Ctrl + K`) and **Copy as cURL**
 - Collections and request history, persisted as JSON
 - Environments with `{{variable}}` substitution (URL, params, headers, body, auth); undefined variables are highlighted
 - Multiple request tabs, cancellable requests, configurable timeout
 - Import / export collections as JSON (a marked `postrust-collections` file; other JSON is rejected, and export only overwrites an earlier export)
 
-Shortcuts: `⌘/Ctrl + Enter` send, `+ S` save, `+ T` new tab, `+ W` close tab.
+Shortcuts: `⌘/Ctrl + K` command palette, `+ Enter` send, `+ S` save, `+ T` new tab, `+ W` close tab.
 
 ## Data
 
@@ -44,6 +48,7 @@ Tokens and passwords are saved **unencrypted** (file mode 0600 on Unix). A corru
 ## Behaviour notes
 
 - A URL without a scheme gets `https://` (`http://` for localhost / 127.0.0.1).
+- Beautify JSON and the Pretty view parse the body, so duplicate object keys collapse to the last value and string escapes are normalised (`\\u00e9` becomes `é`); use Raw (response) or don't beautify (request) if you need repeated keys.
 - Redirects are followed (max 10). Cookies are not persisted.
 - History does not store Auth-tab credentials, but it does keep the URL and any headers you typed yourself (tokens in them are saved in plaintext).
 - Sending is refused while the URL, headers or Auth use an undefined `{{variable}}`; undefined ones in params or the body only show a warning.
@@ -65,7 +70,27 @@ Pull requests into `main` run fmt, clippy and the tests. Pushing to `main` (for 
 
 plus `SHA256SUMS.txt`. **To cut a release, bump `version` in `Cargo.toml` (and commit the updated `Cargo.lock`) in your PR.** Merges that don't bump it publish nothing.
 
-The builds are **unsigned**. On macOS, right-click the app and choose Open the first time (or run `xattr -dr com.apple.quarantine /Applications/postrust.app`). On Windows, choose "More info", then "Run anyway".
+### Verifying downloads
+
+Every release file is signed with [cosign / Sigstore](https://docs.sigstore.dev/) (keyless, tied to this repository's release workflow) and has a GitHub build attestation. This proves the file was built by this repo's workflow and wasn't altered. It does not remove the OS warnings below (that needs paid Apple/Windows certificates).
+
+```bash
+# 1. Checksums
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+
+# 2. GitHub build attestation
+gh attestation verify postrust-<version>-macos-arm64.dmg --repo sajithlaldev/postrust
+
+# 3. cosign signature (download the matching .cosign.bundle next to the file)
+cosign verify-blob postrust-<version>-macos-arm64.dmg \
+  --bundle postrust-<version>-macos-arm64.dmg.cosign.bundle \
+  --certificate-identity-regexp '^https://github.com/sajithlaldev/postrust/\.github/workflows/release\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+The signing job runs after the release is published; if it fails the release stays available but unsigned until the job is re-run.
+
+The apps are **not Apple-notarized or Windows-signed**. On macOS, right-click the app and choose Open the first time (or run `xattr -dr com.apple.quarantine /Applications/postrust.app`). On Windows, choose "More info", then "Run anyway".
 
 ## Develop
 

@@ -1,37 +1,86 @@
-use super::{kv_table, response};
+use super::{kv_table, response, theme, widgets};
 use crate::app::{App, ReqTab};
-use crate::model::{Auth, BodyKind, Method};
-use egui::{Color32, Context, RichText, Ui};
+use crate::model::{Auth, BodyKind, Method, SplitLayout};
+use egui::{Color32, Context, CornerRadius, Frame, Margin, RichText, Sense, Stroke, Ui, vec2};
 
 #[derive(PartialEq)]
 enum Action {
+    UndoBeautify,
     Send,
     Cancel,
     Save,
+    Curl,
+    Beautify,
 }
 
 pub fn tab_bar(app: &mut App, ui: &mut Ui) {
+    let dark = ui.visuals().dark_mode;
+    let accent = theme::accent(dark);
     let mut select = None;
     let mut close = None;
     let mut add = false;
     egui::ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
         ui.horizontal(|ui| {
-            for (i, tab) in app.tabs.iter().enumerate() {
-                let label = format!("{}  {}", tab.request.method.as_str(), tab.request.title());
-                let label: String = if label.chars().count() > 28 {
-                    label.chars().take(27).collect::<String>() + "…"
-                } else {
-                    label
+            for i in 0..app.tabs.len() {
+                let active = i == app.active;
+                let dirty = app.is_tab_dirty(i);
+                let tab = &app.tabs[i];
+                let title: String = {
+                    let t = tab.request.title();
+                    if t.chars().count() > 24 {
+                        t.chars().take(23).collect::<String>() + "..."
+                    } else {
+                        t
+                    }
                 };
-                if ui.selectable_label(i == app.active, label).clicked() {
-                    select = Some(i);
+                let fill = if active {
+                    ui.visuals().widgets.inactive.weak_bg_fill
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let out = Frame::new()
+                    .fill(fill)
+                    .corner_radius(CornerRadius {
+                        nw: 6,
+                        ne: 6,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // The badge selects the tab too, like the title next to it.
+                            if widgets::method_badge(ui, tab.request.method)
+                                .interact(Sense::click())
+                                .clicked()
+                            {
+                                select = Some(i);
+                            }
+                            let label = egui::Label::new(RichText::new(title).strong().color(if active {
+                                ui.visuals().text_color()
+                            } else {
+                                ui.visuals().weak_text_color()
+                            }))
+                            .sense(Sense::click());
+                            if ui.add(label).clicked() {
+                                select = Some(i);
+                            }
+                            if dirty {
+                                let (rect, resp) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                                ui.painter().circle_filled(rect.center(), 3.5, accent);
+                                resp.on_hover_text("Unsaved changes");
+                            }
+                            if ui.small_button("\u{d7}").on_hover_text("Close tab").clicked() {
+                                close = Some(i);
+                            }
+                        });
+                    });
+                if active {
+                    let r = out.response.rect;
+                    ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(2.0, accent));
                 }
-                if ui.small_button("✕").on_hover_text("Close tab").clicked() {
-                    close = Some(i);
-                }
-                ui.add_space(6.0);
             }
-            if ui.button("＋").on_hover_text("New tab").clicked() {
+            if ui.button("+").on_hover_text("New tab").clicked() {
                 add = true;
             }
         });
@@ -42,75 +91,150 @@ pub fn tab_bar(app: &mut App, ui: &mut Ui) {
     if add {
         app.new_tab(Default::default(), None);
     } else if let Some(i) = close {
-        app.close_tab(i);
+        app.request_close_tab(i);
     }
 }
 
 pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
     let idx = app.active;
     let missing = app.missing_vars(&app.tabs[idx].request);
+    let split = app.store.ui.split;
 
     let mut save_body = false;
-    egui::Panel::bottom("response")
-        .resizable(true)
-        .default_size(320.0)
-        .min_size(120.0)
-        .show(ui, |ui| {
-            let tab = &mut app.tabs[idx];
-            ui.push_id(tab.id, |ui| {
-                save_body = response::draw(ui, tab);
-            });
+    // Cap the response panel so the request bar (method, URL and its buttons) always keeps room,
+    // whatever size was saved earlier or however small the window is.
+    let (panel, cap) = match split {
+        SplitLayout::Below => {
+            let max = (ui.available_height() - 220.0).max(160.0);
+            let panel = egui::Panel::bottom("response_below")
+                .resizable(true)
+                .default_size(app.store.ui.response_height.unwrap_or(320.0).min(max))
+                .min_size(140.0)
+                .max_size(max);
+            (panel, max)
+        }
+        SplitLayout::Side => {
+            let max = (ui.available_width() - 480.0).max(260.0);
+            let panel = egui::Panel::right("response_side")
+                .resizable(true)
+                .default_size(app.store.ui.response_width.unwrap_or(460.0).min(max))
+                .min_size(260.0)
+                .max_size(max);
+            (panel, max)
+        }
+    };
+    // The panel's full size (margins included) is the space it takes from the area around it.
+    // `InnerResponse::response.rect` is only the content rectangle, so it can't be used.
+    let space = |ui: &Ui| match split {
+        SplitLayout::Below => ui.available_height(),
+        SplitLayout::Side => ui.available_width(),
+    };
+    let before = space(ui);
+    panel.show(ui, |ui| {
+        // egui shrinks a resizable panel to its content after the first frame, so a short
+        // "No response yet" message would collapse it. Claim the whole panel up front. Unlike
+        // allocating space afterwards, this adds no item spacing, so a full panel can't creep
+        // larger each frame.
+        ui.set_min_size(ui.available_size());
+        let tab = &mut app.tabs[idx];
+        ui.push_id(tab.id, |ui| {
+            save_body = response::draw(ui, tab);
         });
+    });
+    if ctx.input(|i| i.pointer.any_released()) {
+        let size = before - space(ui);
+        // A panel squeezed by a small window sits at its cap, below the size the user saved;
+        // that temporary value must not replace the preference. A panel the user dragged up to
+        // the cap is larger than what was saved, so it is kept.
+        let saved = match split {
+            SplitLayout::Below => app.store.ui.response_height,
+            SplitLayout::Side => app.store.ui.response_width,
+        };
+        if size < cap - 1.0 || saved.is_none_or(|s| size > s) {
+            app.remember_response_size(split, size);
+        }
+    }
 
     let mut action = None;
-    let mut format_failed = false;
+    let dark = ui.visuals().dark_mode;
     let tab = &mut app.tabs[idx];
     egui::ScrollArea::vertical().id_salt("request_scroll").show(ui, |ui| {
         ui.push_id(tab.id, |ui| {
             let r = &mut tab.request;
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut r.name)
-                        .hint_text("Untitled request")
-                        .desired_width(240.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("method")
-                    .selected_text(r.method.as_str())
-                    .width(90.0)
-                    .show_ui(ui, |ui| {
-                        for m in Method::ALL {
-                            ui.selectable_value(&mut r.method, m, m.as_str());
+            ui.add(
+                egui::TextEdit::singleline(&mut r.name)
+                    .hint_text("Untitled request")
+                    .font(egui::TextStyle::Heading)
+                    .frame(Frame::NONE)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(2.0);
+
+            // Request bar: method, URL and the main actions in one rounded strip.
+            Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("method")
+                            .selected_text(
+                                RichText::new(r.method.as_str())
+                                    .strong()
+                                    .color(theme::method_color(r.method, dark)),
+                            )
+                            .width(86.0)
+                            .show_ui(ui, |ui| {
+                                for m in Method::ALL {
+                                    ui.selectable_value(
+                                        &mut r.method,
+                                        m,
+                                        RichText::new(m.as_str()).strong().color(theme::method_color(m, dark)),
+                                    );
+                                }
+                            });
+                        let w = (ui.available_width() - 250.0).max(120.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut r.url)
+                                .hint_text("https://api.example.com/resource  ({{variables}} work here)")
+                                .font(egui::TextStyle::Monospace)
+                                .frame(Frame::NONE)
+                                .desired_width(w),
+                        );
+                        if tab.pending.is_some() {
+                            ui.spinner();
+                            if ui.button("Cancel").clicked() {
+                                action = Some(Action::Cancel);
+                            }
+                        } else {
+                            let send = egui::Button::new(RichText::new("Send").strong().color(theme::on_accent(dark)))
+                                .fill(theme::accent(dark))
+                                .min_size(vec2(72.0, 28.0));
+                            if ui.add(send).clicked() {
+                                action = Some(Action::Send);
+                            }
+                        }
+                        if ui.button("Save").clicked() {
+                            action = Some(Action::Save);
+                        }
+                        if ui
+                            .button("cURL")
+                            .on_hover_text("Copy this request as a curl command (for sh, bash and zsh)")
+                            .clicked()
+                        {
+                            action = Some(Action::Curl);
                         }
                     });
-                let w = (ui.available_width() - 160.0).max(120.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut r.url)
-                        .hint_text("https://api.example.com/resource  (supports {{variables}})")
-                        .desired_width(w),
-                );
-                if tab.pending.is_some() {
-                    if ui.button("Cancel").clicked() {
-                        action = Some(Action::Cancel);
-                    }
-                    ui.spinner();
-                } else if ui.button(RichText::new("Send").strong()).clicked() {
-                    action = Some(Action::Send);
-                }
-                if ui.button("Save").clicked() {
-                    action = Some(Action::Save);
-                }
-            });
+                });
             if !missing.is_empty() {
                 ui.colored_label(
-                    Color32::from_rgb(220, 140, 40),
+                    theme::warning(dark),
                     format!("Undefined variables: {}", missing.join(", ")),
                 );
             }
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let count = |n: usize| if n > 0 { format!(" ({n})") } else { String::new() };
                 let np = r.params.iter().filter(|p| p.enabled && !p.key.is_empty()).count();
@@ -136,17 +260,27 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
                             ui.weak("This request has no body.");
                         }
                         BodyKind::Raw => {
-                            if ui.small_button("Format JSON").clicked() {
-                                match serde_json::from_str::<serde_json::Value>(&r.body) {
-                                    Ok(v) => {
-                                        r.body = serde_json::to_string_pretty(&v).unwrap_or_else(|_| r.body.clone())
-                                    }
-                                    Err(_) => format_failed = true,
-                                }
+                            if ui
+                                .button("Beautify JSON")
+                                .on_hover_text("Pretty-print the body. {{variables}} are kept as written.")
+                                .clicked()
+                            {
+                                action = Some(Action::Beautify);
                             }
+                            // Undo only while the body is still exactly what Beautify produced.
+                            if tab.beautify_undo.as_ref().is_some_and(|(_, after)| *after == r.body)
+                                && ui
+                                    .button("Undo")
+                                    .on_hover_text("Restore the body from before Beautify")
+                                    .clicked()
+                            {
+                                action = Some(Action::UndoBeautify);
+                            }
+                            let mut layouter = super::json::layouter();
                             ui.add(
                                 egui::TextEdit::multiline(&mut r.body)
                                     .code_editor()
+                                    .layouter(&mut layouter)
                                     .desired_rows(10)
                                     .desired_width(f32::INFINITY),
                             );
@@ -162,13 +296,13 @@ pub fn draw(app: &mut App, ui: &mut Ui, ctx: &Context) {
     if save_body {
         app.save_body(idx);
     }
-    if format_failed {
-        app.status = Some("Body is not valid JSON (put {{variables}} inside quotes to format it)".into());
-    }
     match action {
         Some(Action::Send) => app.send(idx, ctx),
         Some(Action::Cancel) => app.cancel(idx),
         Some(Action::Save) => app.save_tab(idx),
+        Some(Action::Curl) => app.copy_curl(idx, ctx),
+        Some(Action::Beautify) => app.beautify_body(idx),
+        Some(Action::UndoBeautify) => app.undo_beautify(idx),
         None => {}
     }
 }

@@ -351,3 +351,257 @@ fn send_is_refused_for_undefined_variables_in_url_or_auth() {
     app.send(0, &ctx);
     assert!(app.tabs[0].pending.is_some());
 }
+
+#[test]
+fn dirty_dot_tracks_unsaved_changes() {
+    let mut app = App::new(None);
+    assert!(!app.is_tab_dirty(0), "a blank tab is not dirty");
+    app.tabs[0].request.url = "http://x".into();
+    assert!(app.is_tab_dirty(0), "an unsaved tab with content is dirty");
+    app.save_tab(0);
+    assert!(!app.is_tab_dirty(0));
+    app.tabs[0].request.body = "changed".into();
+    assert!(app.is_tab_dirty(0));
+    app.tabs[0].request.body.clear();
+    assert!(!app.is_tab_dirty(0), "reverting the edit clears the dot");
+    assert!(!app.is_tab_dirty(99));
+}
+
+#[test]
+fn theme_and_layout_prefs_round_trip_through_storage() {
+    use postrust::model::{SplitLayout, ThemeMode};
+    use postrust::storage::Storage;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.json");
+    {
+        let mut app = App::new(Some(Storage::new(path.clone())));
+        app.set_theme(ThemeMode::Dark);
+        app.toggle_split();
+        app.remember_sidebar_width(301.5);
+        app.remember_response_size(SplitLayout::Side, 420.0);
+        app.remember_response_size(SplitLayout::Below, 280.0);
+        app.mark_dirty();
+        // Saving happens in the frame loop; do it explicitly through the storage API.
+        Storage::new(path.clone()).save(&app.store).unwrap();
+    }
+    let loaded = Storage::new(path).load();
+    assert_eq!(loaded.ui.theme, ThemeMode::Dark);
+    assert_eq!(loaded.ui.split, SplitLayout::Side);
+    assert_eq!(loaded.ui.sidebar_width, Some(301.5));
+    assert_eq!(loaded.ui.response_width, Some(420.0));
+    assert_eq!(loaded.ui.response_height, Some(280.0));
+}
+
+#[test]
+fn old_store_files_without_ui_prefs_still_load() {
+    use postrust::model::{SplitLayout, ThemeMode};
+    let store: Store = serde_json::from_str(r#"{"collections":[],"timeout_secs":5}"#).unwrap();
+    assert_eq!(store.ui.theme, ThemeMode::System);
+    assert_eq!(store.ui.split, SplitLayout::Below);
+    assert_eq!(store.ui.sidebar_width, None);
+}
+
+#[test]
+fn panel_sizes_ignore_noise_and_garbage() {
+    let mut app = App::new(None);
+    app.remember_sidebar_width(250.0);
+    assert_eq!(app.store.ui.sidebar_width, Some(250.0));
+    app.remember_sidebar_width(250.4);
+    assert_eq!(app.store.ui.sidebar_width, Some(250.0), "sub-pixel change ignored");
+    app.remember_sidebar_width(f32::NAN);
+    app.remember_sidebar_width(-5.0);
+    app.remember_sidebar_width(0.0);
+    assert_eq!(app.store.ui.sidebar_width, Some(250.0));
+    app.remember_sidebar_width(300.0);
+    assert_eq!(app.store.ui.sidebar_width, Some(300.0));
+}
+
+#[test]
+fn commands_drive_the_app() {
+    use postrust::commands::Command;
+    use postrust::model::{SplitLayout, ThemeMode};
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+
+    app.run_command(Command::NewTab, &ctx);
+    assert_eq!(app.tabs.len(), 2);
+    app.run_command(Command::CloseTab, &ctx);
+    assert_eq!(app.tabs.len(), 1);
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.run_command(Command::CycleTheme, &ctx);
+        seen.push(app.store.ui.theme);
+    }
+    assert_eq!(seen, vec![ThemeMode::Light, ThemeMode::Dark, ThemeMode::System]);
+
+    app.run_command(Command::ToggleSplit, &ctx);
+    assert_eq!(app.store.ui.split, SplitLayout::Side);
+
+    app.run_command(Command::ManageEnvironments, &ctx);
+    app.run_command(Command::ImportExport, &ctx);
+    assert!(app.show_env && app.show_io);
+
+    app.tabs[0].request.url = "http://x".into();
+    app.run_command(Command::Save, &ctx);
+    assert_eq!(app.store.collections[0].requests.len(), 1);
+}
+
+#[test]
+fn beautify_command_reports_what_it_did() {
+    use postrust::commands::Command;
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+
+    app.run_command(Command::BeautifyBody, &ctx);
+    assert!(app.status.as_deref().unwrap().contains("Raw"));
+
+    app.tabs[0].request.body_kind = BodyKind::Raw;
+    app.run_command(Command::BeautifyBody, &ctx);
+    assert!(app.status.as_deref().unwrap().contains("empty"));
+
+    app.tabs[0].request.body = r#"{"id":{{id}},"a":1}"#.into();
+    app.run_command(Command::BeautifyBody, &ctx);
+    assert!(app.status.as_deref().unwrap().starts_with("Body beautified"));
+    assert!(app.tabs[0].request.body.contains("\n  \"id\": {{id}}"));
+
+    app.tabs[0].request.body = "{oops".into();
+    app.run_command(Command::BeautifyBody, &ctx);
+    assert!(app.status.as_deref().unwrap().starts_with("Cannot beautify"));
+    assert_eq!(app.tabs[0].request.body, "{oops", "invalid JSON is left untouched");
+}
+
+#[test]
+fn copy_curl_resolves_variables_and_reports_errors() {
+    use postrust::commands::Command;
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.run_command(Command::CopyCurl, &ctx);
+    assert!(
+        app.status.as_deref().unwrap().starts_with("Cannot build cURL"),
+        "empty URL"
+    );
+
+    app.store.environments.push(Environment {
+        name: "e".into(),
+        vars: vec![KeyValue::new("host", "h.test")],
+    });
+    app.store.active_env = Some(0);
+    app.tabs[0].request.url = "http://{{host}}/x".into();
+    app.run_command(Command::CopyCurl, &ctx);
+    assert_eq!(app.status.as_deref(), Some("Copied cURL command to the clipboard"));
+}
+
+#[test]
+fn sidebar_search_matches_name_url_and_method() {
+    let mut r = req("Create user");
+    r.url = "https://api.test/Users".into();
+    r.method = Method::Post;
+    assert!(r.matches(""));
+    assert!(r.matches("  "));
+    assert!(r.matches("create"));
+    assert!(r.matches("USERS"));
+    assert!(r.matches("post"));
+    assert!(!r.matches("delete"));
+}
+
+#[test]
+fn beautify_can_be_undone_until_the_body_is_edited() {
+    use postrust::commands::Command;
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    let original = r#"{"b":1,"a":2}"#;
+    app.tabs[0].request.body_kind = BodyKind::Raw;
+    app.tabs[0].request.body = original.into();
+    app.run_command(Command::BeautifyBody, &ctx);
+    assert_ne!(app.tabs[0].request.body, original);
+
+    app.undo_beautify(0);
+    assert_eq!(app.tabs[0].request.body, original);
+    assert_eq!(app.status.as_deref(), Some("Beautify undone"));
+    app.undo_beautify(0);
+    assert_eq!(app.status.as_deref(), Some("Nothing to undo"), "undo is single use");
+
+    // Editing after Beautify must not be clobbered by Undo.
+    app.run_command(Command::BeautifyBody, &ctx);
+    app.tabs[0].request.body.push_str("\n// my edit");
+    let edited = app.tabs[0].request.body.clone();
+    app.undo_beautify(0);
+    assert_eq!(app.tabs[0].request.body, edited);
+    assert_eq!(app.status.as_deref(), Some("Nothing to undo"));
+}
+
+#[test]
+fn closing_a_clean_tab_is_immediate_and_a_dirty_tab_asks_first() {
+    use postrust::app::CloseChoice;
+    use postrust::commands::Command;
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.new_tab(Request::default(), None);
+    assert_eq!(app.tabs.len(), 2);
+    app.run_command(Command::CloseTab, &ctx);
+    assert_eq!(app.tabs.len(), 1, "a blank tab closes without asking");
+    assert!(app.confirm_close.is_none());
+
+    app.tabs[0].request.url = "http://x".into();
+    app.run_command(Command::CloseTab, &ctx);
+    assert_eq!(app.tabs.len(), 1, "a dirty tab is kept while the user decides");
+    assert_eq!(app.confirm_close, Some(app.tabs[0].id));
+
+    app.resolve_close(CloseChoice::Cancel);
+    assert!(app.confirm_close.is_none());
+    assert_eq!(app.tabs[0].request.url, "http://x", "cancel keeps the edits");
+
+    app.run_command(Command::CloseTab, &ctx);
+    app.resolve_close(CloseChoice::Discard);
+    assert_eq!(app.tabs.len(), 1, "closing the last tab leaves a fresh blank one");
+    assert_eq!(app.tabs[0].request, Request::default());
+    assert!(app.store.collections.is_empty(), "discard saves nothing");
+
+    app.tabs[0].request.url = "http://saved".into();
+    app.run_command(Command::CloseTab, &ctx);
+    app.resolve_close(CloseChoice::Save);
+    assert_eq!(app.store.collections[0].requests[0].url, "http://saved");
+    assert_eq!(app.tabs[0].request, Request::default());
+}
+
+#[test]
+fn resolving_a_close_for_a_tab_that_vanished_is_harmless() {
+    use postrust::app::CloseChoice;
+    let mut app = App::new(None);
+    app.new_tab(Request::new("other"), None);
+    app.tabs[1].request.url = "http://x".into();
+    app.request_close_tab(1);
+    let id = app.confirm_close.unwrap();
+    app.close_tab(1); // closed by some other route meanwhile
+    assert!(app.tabs.iter().all(|t| t.id != id));
+    app.resolve_close(CloseChoice::Discard);
+    assert!(app.confirm_close.is_none());
+    assert_eq!(app.tabs.len(), 1);
+    app.resolve_close(CloseChoice::Discard); // nothing pending: no-op
+}
+
+#[test]
+fn a_history_tab_is_clean_until_edited_and_closes_without_asking() {
+    let mut app = App::new(None);
+    let mut from_history = req("old");
+    from_history.url = "http://h.test/a".into();
+    app.new_tab(from_history, None);
+    let idx = app.tabs.len() - 1;
+    assert!(
+        !app.is_tab_dirty(idx),
+        "opening a history entry is not an unsaved change"
+    );
+    app.request_close_tab(idx);
+    assert!(app.confirm_close.is_none(), "no prompt for an untouched tab");
+    assert_eq!(app.tabs.len(), 1);
+
+    let mut again = req("old");
+    again.url = "http://h.test/a".into();
+    app.new_tab(again, None);
+    let idx = app.tabs.len() - 1;
+    app.tabs[idx].request.body = "edited".into();
+    assert!(app.is_tab_dirty(idx));
+    app.tabs[idx].request.body.clear();
+    assert!(!app.is_tab_dirty(idx), "reverting to how it opened clears the dot");
+}

@@ -1,9 +1,14 @@
+mod json;
+mod palette;
 mod request;
 mod response;
 mod sidebar;
+mod theme;
+mod widgets;
 mod windows;
 
 use crate::app::App;
+use crate::commands::Command;
 use crate::model::KeyValue;
 use egui::{Key, Modifiers, Ui};
 
@@ -17,7 +22,7 @@ pub fn kv_table(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::Debug, rows:
     for (i, row) in rows.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             changed |= kv_row(ui, row);
-            if ui.small_button("✕").on_hover_text("Remove").clicked() {
+            if ui.small_button("×").on_hover_text("Remove").clicked() {
                 remove = Some(i);
             }
         });
@@ -62,45 +67,67 @@ fn kv_row(ui: &mut Ui, row: &mut KeyValue) -> bool {
 pub fn draw(app: &mut App, ui: &mut Ui) {
     let ctx = ui.ctx().clone();
 
-    // Global shortcuts.
-    let send = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
-    let save = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S));
-    let new_tab = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T));
-    let close = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W));
-    if send {
-        app.send(app.active, &ctx);
+    // Install the look once, then follow the user's System / Light / Dark choice.
+    if app.applied_theme != Some(app.store.ui.theme) {
+        if app.applied_theme.is_none() {
+            theme::install(&ctx);
+        }
+        theme::apply_mode(&ctx, app.store.ui.theme);
+        app.applied_theme = Some(app.store.ui.theme);
     }
-    if save {
-        app.save_tab(app.active);
+
+    // Global shortcuts. While the palette is open it owns the keyboard.
+    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+        palette::toggle(app);
     }
-    if new_tab {
-        app.new_tab(Default::default(), None);
-    }
-    if close {
-        app.close_tab(app.active);
+    // Shortcuts pause while the palette or the unsaved-changes dialog has the user's attention.
+    if app.palette.is_none() && app.confirm_close.is_none() {
+        for (key, command) in [
+            (Key::Enter, Command::Send),
+            (Key::S, Command::Save),
+            (Key::T, Command::NewTab),
+            (Key::W, Command::CloseTab),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, key)) {
+                app.run_command(command, &ctx);
+            }
+        }
     }
 
     egui::Panel::top("top").show(ui, |ui| windows::top_bar(app, ui));
-    egui::Panel::left("sidebar")
-        .default_size(260.0)
-        .min_size(180.0)
+
+    let sidebar = egui::Panel::left("sidebar")
+        .default_size(app.store.ui.sidebar_width.unwrap_or(280.0))
+        .min_size(200.0)
         .show(ui, |ui| sidebar::draw(app, ui));
+    // Remember the width when the user lets go of the mouse (so merely viewing, or a window
+    // resize, never rewrites the saved preference or dirties the store at startup).
+    if ctx.input(|i| i.pointer.any_released()) {
+        app.remember_sidebar_width(sidebar.response.rect.width());
+    }
+
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(app.status.clone().unwrap_or_else(|| "Ready".into()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let m = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
-                ui.weak(format!("{m}Enter send · {m}S save · {m}T new tab · {m}W close tab"));
+                let m = theme::modifier();
+                ui.weak(format!(
+                    "{m}K commands  |  {m}Enter send  |  {m}S save  |  {m}T new tab  |  {m}W close tab"
+                ));
             });
         });
     });
-    egui::CentralPanel::default().show(ui, |ui| {
-        request::tab_bar(app, ui);
-        ui.separator();
-        request::draw(app, ui, &ctx);
-    });
+    egui::CentralPanel::default()
+        .frame(egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(14, 10)))
+        .show(ui, |ui| {
+            request::tab_bar(app, ui);
+            ui.add_space(6.0);
+            request::draw(app, ui, &ctx);
+        });
 
     windows::env_window(app, &ctx);
     windows::io_window(app, &ctx);
     windows::rename_window(app, &ctx);
+    windows::close_confirm_window(app, &ctx);
+    palette::show(app, &ctx);
 }

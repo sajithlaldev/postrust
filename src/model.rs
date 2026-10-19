@@ -106,6 +106,15 @@ impl Request {
         }
     }
 
+    /// Case-insensitive match on name, URL or method; an empty query matches everything.
+    pub fn matches(&self, query: &str) -> bool {
+        let q = query.trim().to_lowercase();
+        q.is_empty()
+            || self.name.to_lowercase().contains(&q)
+            || self.url.to_lowercase().contains(&q)
+            || self.method.as_str().to_lowercase().contains(&q)
+    }
+
     /// Label for tabs and lists: the name, falling back to method + URL.
     pub fn title(&self) -> String {
         if !self.name.trim().is_empty() {
@@ -132,6 +141,67 @@ pub struct Environment {
     pub vars: Vec<KeyValue>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub fn next(self) -> Self {
+        match self {
+            ThemeMode::System => ThemeMode::Light,
+            ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::Dark => ThemeMode::System,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeMode::System => "System",
+            ThemeMode::Light => "Light",
+            ThemeMode::Dark => "Dark",
+        }
+    }
+}
+
+/// Where the response panel sits relative to the request editor.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SplitLayout {
+    #[default]
+    Below,
+    Side,
+}
+
+impl SplitLayout {
+    pub fn toggled(self) -> Self {
+        match self {
+            SplitLayout::Below => SplitLayout::Side,
+            SplitLayout::Side => SplitLayout::Below,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SplitLayout::Below => "Response below",
+            SplitLayout::Side => "Response beside",
+        }
+    }
+}
+
+/// Look-and-feel settings that survive restarts.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct UiPrefs {
+    pub theme: ThemeMode,
+    pub split: SplitLayout,
+    pub sidebar_width: Option<f32>,
+    pub response_height: Option<f32>,
+    pub response_width: Option<f32>,
+}
+
 pub const HISTORY_LIMIT: usize = 50;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -142,6 +212,7 @@ pub struct Store {
     pub active_env: Option<usize>,
     pub history: Vec<Request>,
     pub timeout_secs: Option<u64>,
+    pub ui: UiPrefs,
 }
 
 impl Store {

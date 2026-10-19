@@ -1,8 +1,10 @@
 use super::kv_table;
-use crate::app::App;
+use crate::app::{App, CloseChoice};
+use crate::model::ThemeMode;
 use egui::{Context, Ui};
 
 pub fn top_bar(app: &mut App, ui: &mut Ui) {
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         if app.logo.is_none()
             && let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-64.png"))
@@ -17,7 +19,7 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
                     .fit_to_exact_size(egui::vec2(26.0, 26.0)),
             );
         }
-        ui.heading("postrust");
+        ui.label(egui::RichText::new("postrust").heading().strong());
         ui.separator();
         ui.label("Environment");
         let current = app
@@ -42,11 +44,31 @@ pub fn top_bar(app: &mut App, ui: &mut Ui) {
             app.show_env = !app.show_env;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut mode = app.store.ui.theme;
+            egui::ComboBox::from_id_salt("theme_select")
+                .selected_text(format!("Theme: {}", mode.label()))
+                .show_ui(ui, |ui| {
+                    for m in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+                        ui.selectable_value(&mut mode, m, m.label());
+                    }
+                });
+            app.set_theme(mode);
+            if ui
+                .button(app.store.ui.split.toggled().label())
+                .on_hover_text("Move the response panel")
+                .clicked()
+            {
+                app.toggle_split();
+            }
             if ui.button("Import / Export").clicked() {
                 app.show_io = !app.show_io;
             }
+            if ui.button(format!("Commands ({}K)", super::theme::modifier())).clicked() {
+                super::palette::toggle(app);
+            }
         });
     });
+    ui.add_space(2.0);
 }
 
 pub fn env_window(app: &mut App, ctx: &Context) {
@@ -71,7 +93,7 @@ pub fn env_window(app: &mut App, ctx: &Context) {
                         app.env_sel = i;
                     }
                 }
-                if ui.button("＋ New").clicked() {
+                if ui.button("+ New").clicked() {
                     app.add_environment();
                 }
             });
@@ -152,5 +174,40 @@ pub fn rename_window(app: &mut App, ctx: &Context) {
     }
     if keep {
         app.rename = Some((target, name));
+    }
+}
+
+/// Asks what to do with a tab that has unsaved changes the user is closing.
+pub fn close_confirm_window(app: &mut App, ctx: &Context) {
+    let Some(id) = app.confirm_close else { return };
+    let Some(title) = app.tabs.iter().find(|t| t.id == id).map(|t| t.request.title()) else {
+        app.confirm_close = None; // the tab went away some other way
+        return;
+    };
+    let mut choice = None;
+    egui::Window::new("Unsaved changes")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(format!("\"{title}\" has changes that are not saved."));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save and close").clicked() {
+                    choice = Some(CloseChoice::Save);
+                }
+                if ui.button("Discard changes").clicked() {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+        });
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        choice = Some(CloseChoice::Cancel);
+    }
+    if let Some(choice) = choice {
+        app.resolve_close(choice);
     }
 }

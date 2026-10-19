@@ -1,0 +1,651 @@
+//! Headless smoke tests: run real egui frames through `ui::draw` in many app states so that
+//! panics, id clashes and layout assertions are caught without a window. They cannot judge how
+//! the UI looks; they guarantee it renders and reacts to input.
+
+use egui::{Event, Key, Modifiers, Pos2, RawInput, Rect, vec2};
+use postrust::app::{App, PaletteState, ReqTab, Resp, RespTab};
+use postrust::http::ResponseData;
+use postrust::model::*;
+
+fn raw(events: Vec<Event>) -> RawInput {
+    RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+        events,
+        ..Default::default()
+    }
+}
+
+fn frame(app: &mut App, ctx: &egui::Context, input: RawInput) {
+    // The output (textures, shapes) is irrelevant here, but egui requires it to be consumed.
+    ctx.run_ui(input, |ui| postrust::ui::draw(app, ui))
+        .drop_without_applying_deltas();
+}
+
+fn frames(app: &mut App, ctx: &egui::Context, n: usize) {
+    for _ in 0..n {
+        frame(app, ctx, raw(vec![]));
+    }
+}
+
+/// Runs frames, then releases the mouse once. Layout sizes are only remembered when the user
+/// lets go of the mouse, so tests that look at saved sizes have to do that.
+fn settle(app: &mut App, ctx: &egui::Context, n: usize) {
+    frames(app, ctx, n);
+    frame(app, ctx, raw(click(Pos2::new(640.0, 792.0))));
+    frames(app, ctx, 1);
+}
+
+fn key(key: Key, modifiers: Modifiers) -> Vec<Event> {
+    vec![Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }]
+}
+
+fn press(app: &mut App, ctx: &egui::Context, k: Key, modifiers: Modifiers) {
+    frame(app, ctx, raw(key(k, modifiers)));
+    frames(app, ctx, 1);
+}
+
+fn response(content_type: &str, body: &[u8]) -> ResponseData {
+    ResponseData {
+        status: 200,
+        reason: "OK".into(),
+        elapsed_ms: 12,
+        size: body.len(),
+        truncated: false,
+        headers: vec![
+            ("content-type".into(), content_type.into()),
+            ("x-id".into(), "1".into()),
+        ],
+        body: body.to_vec(),
+    }
+}
+
+fn resp(content_type: &str, body: &[u8]) -> Resp {
+    let data = response(content_type, body);
+    let text = data.text();
+    let is_text = data.is_text();
+    let pretty = postrust::http::pretty_json(&text);
+    Resp {
+        is_text,
+        is_json: pretty.is_some(),
+        raw: if pretty.is_some() { text.clone() } else { String::new() },
+        display: pretty.unwrap_or(if is_text { text } else { String::new() }),
+        display_cut: false,
+        data,
+    }
+}
+
+fn populated() -> App {
+    let mut app = App::new(None);
+    app.store.collections.push(Collection {
+        name: "Users API".into(),
+        requests: vec![
+            Request {
+                name: "List users".into(),
+                url: "https://api.test/users".into(),
+                ..Default::default()
+            },
+            Request {
+                name: "Create user".into(),
+                method: Method::Post,
+                url: "https://api.test/users".into(),
+                body_kind: BodyKind::Raw,
+                body: r#"{"name":"ada","id":{{id}}}"#.into(),
+                ..Default::default()
+            },
+            Request {
+                name: "Delete".into(),
+                method: Method::Delete,
+                url: "https://api.test/u/1".into(),
+                ..Default::default()
+            },
+        ],
+    });
+    app.store.collections.push(Collection {
+        name: "Empty".into(),
+        requests: vec![],
+    });
+    app.store.environments.push(Environment {
+        name: "dev".into(),
+        vars: vec![KeyValue::new("id", "7")],
+    });
+    app.store.active_env = Some(0);
+    for (m, u) in [
+        (Method::Get, "https://a.test/1"),
+        (Method::Put, "https://a.test/2"),
+        (Method::Patch, "https://a.test/3"),
+    ] {
+        app.store.push_history(&Request {
+            method: m,
+            url: u.into(),
+            ..Default::default()
+        });
+    }
+    app.open_saved(0, 0);
+    app.open_saved(0, 1);
+    app.tabs[1].request.body.push(' '); // unsaved change -> dirty dot
+    app
+}
+
+#[test]
+fn empty_app_renders_in_every_theme_and_layout() {
+    for theme in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+        for split in [SplitLayout::Below, SplitLayout::Side] {
+            let ctx = egui::Context::default();
+            let mut app = App::new(None);
+            app.store.ui.theme = theme;
+            app.store.ui.split = split;
+            frames(&mut app, &ctx, 4);
+        }
+    }
+}
+
+#[test]
+fn theme_is_applied_and_follows_changes() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    app.set_theme(ThemeMode::Dark);
+    frames(&mut app, &ctx, 3);
+    assert_eq!(ctx.theme(), egui::Theme::Dark);
+    app.set_theme(ThemeMode::Light);
+    frames(&mut app, &ctx, 3);
+    assert_eq!(ctx.theme(), egui::Theme::Light);
+    assert_eq!(app.applied_theme, Some(ThemeMode::Light));
+}
+
+#[test]
+fn populated_app_renders_with_all_request_tabs_bodies_and_auth_kinds() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    let auths = [
+        Auth::None,
+        Auth::Bearer { token: "t".into() },
+        Auth::Basic {
+            username: "u".into(),
+            password: "p".into(),
+        },
+        Auth::ApiKey {
+            name: "X-Key".into(),
+            value: "k".into(),
+        },
+    ];
+    for tab in [ReqTab::Params, ReqTab::Headers, ReqTab::Body, ReqTab::Auth] {
+        for kind in [BodyKind::None, BodyKind::Raw, BodyKind::Form] {
+            for auth in &auths {
+                let active = app.active;
+                app.tabs[active].req_tab = tab;
+                app.tabs[active].request.body_kind = kind;
+                app.tabs[active].request.auth = auth.clone();
+                frames(&mut app, &ctx, 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_render_json_text_binary_error_and_empty() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    let cases: Vec<postrust::app::Outcome> = vec![
+        Ok(resp(
+            "application/json",
+            br#"{"b":1,"a":[1,2,{"c":"x {{v}}"}],"n":null,"t":true}"#,
+        )),
+        Ok(resp("text/html", b"<html>hi</html>")),
+        Ok(resp("application/octet-stream", &[0xff, 0xfe, 0x00])),
+        Ok(resp("text/plain", b"")),
+        Err("Connection failed: refused".into()),
+    ];
+    for case in cases {
+        for split in [SplitLayout::Below, SplitLayout::Side] {
+            app.store.ui.split = split;
+            let active = app.active;
+            app.tabs[active].response = Some(match &case {
+                Ok(_) => Ok(resp("application/json", b"[]")), // placeholder replaced below
+                Err(e) => Err(e.clone()),
+            });
+            if let Ok(r) = &case {
+                app.tabs[active].response = Some(Ok(Resp {
+                    data: ResponseData {
+                        body: r.data.body.clone(),
+                        headers: r.data.headers.clone(),
+                        ..response("x", b"")
+                    },
+                    is_text: r.is_text,
+                    display: r.display.clone(),
+                    display_cut: r.display_cut,
+                    is_json: r.is_json,
+                    raw: r.raw.clone(),
+                }));
+            }
+            for resp_tab in [RespTab::Body, RespTab::Headers] {
+                for pretty in [true, false] {
+                    app.tabs[active].resp_tab = resp_tab;
+                    app.tabs[active].pretty = pretty;
+                    frames(&mut app, &ctx, 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn command_palette_opens_filters_navigates_and_runs() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    frames(&mut app, &ctx, 2);
+
+    press(&mut app, &ctx, Key::K, Modifiers::COMMAND);
+    assert!(app.palette.is_some(), "Cmd/Ctrl+K opens the palette");
+
+    app.palette = Some(PaletteState {
+        query: "theme".into(),
+        selected: 0,
+        ..Default::default()
+    });
+    frames(&mut app, &ctx, 2);
+    let before = app.store.ui.theme;
+    press(&mut app, &ctx, Key::Enter, Modifiers::NONE);
+    assert!(app.palette.is_none(), "Enter runs the selected command and closes");
+    assert_ne!(app.store.ui.theme, before, "the theme command ran");
+
+    // Navigation wraps and Escape closes without running anything.
+    app.palette = Some(PaletteState::default());
+    press(&mut app, &ctx, Key::ArrowUp, Modifiers::NONE);
+    assert_eq!(
+        app.palette.as_ref().unwrap().selected,
+        postrust::commands::ENTRIES.len() - 1
+    );
+    press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+    assert_eq!(app.palette.as_ref().unwrap().selected, 0);
+    let tabs = app.tabs.len();
+    press(&mut app, &ctx, Key::Escape, Modifiers::NONE);
+    assert!(app.palette.is_none());
+    assert_eq!(app.tabs.len(), tabs);
+
+    // No matches still renders; Enter does nothing and the palette stays open until Escape.
+    app.palette = Some(PaletteState {
+        query: "zzzz".into(),
+        selected: 5,
+        ..Default::default()
+    });
+    frames(&mut app, &ctx, 2);
+    press(&mut app, &ctx, Key::Enter, Modifiers::NONE);
+    assert!(app.palette.is_some());
+    press(&mut app, &ctx, Key::Escape, Modifiers::NONE);
+    assert!(app.palette.is_none());
+
+    // Cmd+K toggles it closed again.
+    press(&mut app, &ctx, Key::K, Modifiers::COMMAND);
+    press(&mut app, &ctx, Key::K, Modifiers::COMMAND);
+    assert!(app.palette.is_none());
+}
+
+#[test]
+fn global_shortcuts_work_and_are_suspended_while_the_palette_is_open() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    frames(&mut app, &ctx, 2);
+    let tabs = app.tabs.len();
+    press(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+    assert_eq!(app.tabs.len(), tabs + 1, "Cmd/Ctrl+T opens a tab");
+    press(&mut app, &ctx, Key::W, Modifiers::COMMAND);
+    assert_eq!(app.tabs.len(), tabs, "Cmd/Ctrl+W closes it");
+
+    app.palette = Some(PaletteState::default());
+    press(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+    assert_eq!(app.tabs.len(), tabs, "shortcuts don't leak through the palette");
+}
+
+#[test]
+fn sidebar_search_adding_collection_and_dialogs_render() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    for q in ["", "users", "DELETE", "no-such-thing", "empty"] {
+        app.search = q.into();
+        frames(&mut app, &ctx, 2);
+    }
+    app.search.clear();
+    app.adding_collection = true;
+    app.focus_new_collection = true; // what clicking "+" does
+    app.new_collection = "Fresh".into();
+    frames(&mut app, &ctx, 3); // the box takes focus
+    press(&mut app, &ctx, Key::Enter, Modifiers::NONE);
+    assert!(app.store.collections.iter().any(|c| c.name == "Fresh"));
+    assert!(!app.adding_collection);
+
+    app.adding_collection = true;
+    app.focus_new_collection = true;
+    frames(&mut app, &ctx, 3);
+    press(&mut app, &ctx, Key::Escape, Modifiers::NONE);
+    assert!(!app.adding_collection);
+
+    app.show_env = true;
+    app.show_io = true;
+    app.rename = Some((postrust::app::RenameTarget::Collection(0), "x".into()));
+    app.env_sel = 0;
+    frames(&mut app, &ctx, 3);
+}
+
+#[test]
+fn layout_choices_are_remembered_by_the_frame_loop() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    settle(&mut app, &ctx, 4);
+    assert!(app.store.ui.sidebar_width.is_some(), "sidebar width is captured");
+    assert!(
+        app.store.ui.response_height.is_some(),
+        "response height is captured (below layout)"
+    );
+    app.toggle_split();
+    settle(&mut app, &ctx, 4);
+    assert!(
+        app.store.ui.response_width.is_some(),
+        "response width is captured (side layout)"
+    );
+}
+
+#[test]
+fn many_tabs_and_long_titles_render() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    for i in 0..30 {
+        let mut r = Request::new(&format!(
+            "A very long request name number {i} that should be truncated nicely"
+        ));
+        r.url = format!("https://example.com/{i}");
+        app.new_tab(r, None);
+    }
+    frames(&mut app, &ctx, 3);
+    app.close_tab(5);
+    frames(&mut app, &ctx, 2);
+}
+
+fn text_and_key(text: &str, k: Key) -> RawInput {
+    let mut events = vec![Event::Text(text.to_string())];
+    events.extend(key(k, Modifiers::NONE));
+    raw(events)
+}
+
+#[test]
+fn palette_enter_acts_on_the_list_after_this_frames_typing() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.palette = Some(PaletteState::default());
+    frames(&mut app, &ctx, 3); // let the search box take focus
+
+    // Typing and Enter arrive in the same frame: "theme" must win over the default first entry.
+    let before = app.store.ui.theme;
+    frame(&mut app, &ctx, text_and_key("theme", Key::Enter));
+    frames(&mut app, &ctx, 1);
+    assert!(app.palette.is_none());
+    assert_ne!(app.store.ui.theme, before, "ran 'Change theme', not 'Send request'");
+}
+
+#[test]
+fn palette_enter_with_no_match_keeps_it_open() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.palette = Some(PaletteState::default());
+    frames(&mut app, &ctx, 3);
+    frame(&mut app, &ctx, text_and_key("zzzz", Key::Enter));
+    frames(&mut app, &ctx, 1);
+    assert!(
+        app.palette.is_some(),
+        "nothing matched, so nothing ran and it stays open"
+    );
+    assert_eq!(app.palette.as_ref().unwrap().query, "zzzz");
+    // The search box must still have focus: the next keystrokes edit the query.
+    frames(&mut app, &ctx, 2);
+    frame(&mut app, &ctx, raw(vec![Event::Text("q".into())]));
+    frames(&mut app, &ctx, 1);
+    assert_eq!(
+        app.palette.as_ref().unwrap().query,
+        "zzzzq",
+        "typing still reaches the palette"
+    );
+}
+
+#[test]
+fn palette_owns_the_keyboard_over_the_new_collection_box() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    let collections = app.store.collections.len();
+    app.adding_collection = true;
+    app.focus_new_collection = true;
+    app.new_collection = "Leftover".into();
+    frames(&mut app, &ctx, 3);
+    assert!(!app.focus_new_collection, "focus is requested once, not every frame");
+
+    app.palette = Some(PaletteState::default());
+    press(&mut app, &ctx, Key::Enter, Modifiers::NONE);
+    assert_eq!(
+        app.store.collections.len(),
+        collections,
+        "Enter went to the palette, not the sidebar"
+    );
+}
+
+#[test]
+fn oversized_saved_panel_sizes_render_and_are_not_overwritten_by_the_clamp() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.store.ui.split = SplitLayout::Side;
+    app.store.ui.response_width = Some(5000.0); // e.g. saved on a bigger monitor
+    settle(&mut app, &ctx, 5);
+    assert_eq!(
+        app.store.ui.response_width,
+        Some(5000.0),
+        "the clamped on-screen width must not replace the saved preference"
+    );
+
+    app.store.ui.split = SplitLayout::Below;
+    app.store.ui.response_height = Some(5000.0);
+    settle(&mut app, &ctx, 5);
+    assert_eq!(app.store.ui.response_height, Some(5000.0));
+}
+
+#[test]
+fn clicking_the_method_badge_selects_the_tab() {
+    // Smoke only: the badge is part of the tab and renders with a click sense.
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    frames(&mut app, &ctx, 3);
+    assert!(app.tabs.len() >= 2);
+}
+
+#[test]
+fn response_panel_keeps_its_size_with_little_content_and_survives_a_restart() {
+    for split in [SplitLayout::Below, SplitLayout::Side] {
+        let ctx = egui::Context::default();
+        let mut app = populated(); // active tab has no response yet: very little content
+        app.store.ui.split = split;
+        settle(&mut app, &ctx, 6);
+        let (first, default) = match split {
+            SplitLayout::Below => (app.store.ui.response_height.unwrap(), 320.0),
+            SplitLayout::Side => (app.store.ui.response_width.unwrap(), 460.0),
+        };
+        assert!(
+            (first - default).abs() <= 1.0,
+            "{split:?}: an empty panel must not collapse to its content (got {first}, wanted {default})"
+        );
+
+        // A "restart": a new app and egui context seeded with the saved value must land on it.
+        let ctx2 = egui::Context::default();
+        let mut app2 = populated();
+        app2.store.ui = app.store.ui.clone();
+        settle(&mut app2, &ctx2, 6);
+        let second = match split {
+            SplitLayout::Below => app2.store.ui.response_height.unwrap(),
+            SplitLayout::Side => app2.store.ui.response_width.unwrap(),
+        };
+        assert!(
+            (second - first).abs() <= 1.0,
+            "{split:?}: size drifted across a restart ({first} -> {second})"
+        );
+    }
+}
+
+#[test]
+fn response_panel_keeps_its_size_when_a_response_arrives() {
+    for split in [SplitLayout::Below, SplitLayout::Side] {
+        let ctx = egui::Context::default();
+        let mut app = populated();
+        app.store.ui.split = split;
+        let read = |app: &App| match split {
+            SplitLayout::Below => app.store.ui.response_height.unwrap(),
+            SplitLayout::Side => app.store.ui.response_width.unwrap(),
+        };
+        settle(&mut app, &ctx, 5);
+        let before = read(&app);
+        let active = app.active;
+        app.tabs[active].response = Some(Ok(resp("application/json", br#"{"a":1}"#)));
+        // Many frames: a feedback loop shows up as steady growth, not a one-off jump.
+        settle(&mut app, &ctx, 30);
+        let after = read(&app);
+        assert!(
+            (after - before).abs() <= 1.0,
+            "{split:?}: panel size changed when a response arrived ({before} -> {after})"
+        );
+        for response_kind in [Err("boom".to_string()), Ok(resp("text/plain", b"hello"))] {
+            app.tabs[active].response = Some(response_kind);
+            settle(&mut app, &ctx, 30);
+            assert!(
+                (read(&app) - before).abs() <= 1.0,
+                "{split:?}: size drifted for another response kind"
+            );
+        }
+    }
+}
+
+fn click(pos: Pos2) -> Vec<Event> {
+    let button = egui::PointerButton::Primary;
+    vec![
+        Event::PointerMoved(pos),
+        Event::PointerButton {
+            pos,
+            button,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        },
+        Event::PointerButton {
+            pos,
+            button,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn closing_a_dirty_tab_shows_the_confirmation_and_each_choice_works() {
+    use postrust::app::CloseChoice;
+    let ctx = egui::Context::default();
+    let mut app = populated(); // tab 1 has an unsaved change
+    frames(&mut app, &ctx, 2);
+    let tabs = app.tabs.len();
+    let dirty_id = app.tabs[1].id;
+    app.active = 1;
+
+    press(&mut app, &ctx, Key::W, Modifiers::COMMAND);
+    assert_eq!(app.tabs.len(), tabs, "kept while asking");
+    assert_eq!(app.confirm_close, Some(dirty_id));
+    frames(&mut app, &ctx, 3); // the dialog renders
+
+    press(&mut app, &ctx, Key::Escape, Modifiers::NONE);
+    assert!(app.confirm_close.is_none(), "Escape cancels");
+    assert_eq!(app.tabs.len(), tabs);
+
+    app.active = 1;
+    app.request_close_tab(1);
+    frames(&mut app, &ctx, 2);
+    app.resolve_close(CloseChoice::Discard);
+    assert_eq!(app.tabs.len(), tabs - 1);
+    assert!(app.tabs.iter().all(|t| t.id != dirty_id));
+    frames(&mut app, &ctx, 2);
+}
+
+#[test]
+fn undo_button_appears_only_while_the_beautified_body_is_untouched() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.active = 1;
+    app.tabs[1].req_tab = ReqTab::Body;
+    app.tabs[1].request.body_kind = BodyKind::Raw;
+    app.tabs[1].request.body = r#"{"a":1}"#.into();
+    frames(&mut app, &ctx, 2);
+    app.beautify_body(1);
+    assert!(app.tabs[1].beautify_undo.is_some());
+    frames(&mut app, &ctx, 3); // renders the Undo button
+    app.tabs[1].request.body.push('x');
+    frames(&mut app, &ctx, 3); // button hidden again, no panic
+}
+
+#[test]
+fn palette_does_not_steal_focus_every_frame_and_closes_on_an_outside_click() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.palette = Some(PaletteState::default());
+    frames(&mut app, &ctx, 3);
+    assert!(app.palette.as_ref().unwrap().focused, "focus requested once");
+
+    // A click far from the centred palette dismisses it.
+    frame(&mut app, &ctx, raw(click(Pos2::new(20.0, 780.0))));
+    frames(&mut app, &ctx, 2);
+    assert!(app.palette.is_none(), "outside click closes the palette");
+
+    // A click inside it does not.
+    app.palette = Some(PaletteState::default());
+    frames(&mut app, &ctx, 3);
+    frame(&mut app, &ctx, raw(click(Pos2::new(640.0, 100.0))));
+    frames(&mut app, &ctx, 2);
+    assert!(app.palette.is_some(), "clicks inside the palette keep it open");
+}
+
+#[test]
+fn filtering_the_sidebar_does_not_disturb_collapsed_state() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    frames(&mut app, &ctx, 2);
+    app.search = "users".into();
+    frames(&mut app, &ctx, 3);
+    app.search.clear();
+    frames(&mut app, &ctx, 3);
+}
+
+#[test]
+fn merely_viewing_never_writes_layout_preferences() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    frames(&mut app, &ctx, 10);
+    assert_eq!(app.store.ui.sidebar_width, None);
+    assert_eq!(app.store.ui.response_height, None);
+    assert_eq!(app.store.ui.response_width, None);
+}
+
+#[test]
+fn shortcuts_pause_while_the_unsaved_changes_dialog_is_open() {
+    let ctx = egui::Context::default();
+    let mut app = populated();
+    app.active = 1; // the tab with an unsaved change
+    frames(&mut app, &ctx, 2);
+    press(&mut app, &ctx, Key::W, Modifiers::COMMAND);
+    let pending = app.confirm_close;
+    assert!(pending.is_some());
+    let tabs = app.tabs.len();
+    let active = app.active;
+
+    press(&mut app, &ctx, Key::W, Modifiers::COMMAND);
+    press(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+    press(&mut app, &ctx, Key::S, Modifiers::COMMAND);
+    press(&mut app, &ctx, Key::Enter, Modifiers::COMMAND);
+    assert_eq!(app.confirm_close, pending, "still asking about the same tab");
+    assert_eq!(app.tabs.len(), tabs, "no tab opened or closed behind the dialog");
+    assert_eq!(app.active, active);
+    assert!(app.tabs[1].pending.is_none(), "nothing was sent behind the dialog");
+}

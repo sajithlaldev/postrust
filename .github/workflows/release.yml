@@ -200,5 +200,51 @@ jobs:
             --target "${GITHUB_SHA}" \
             --title "postrust ${tag}" \
             --generate-notes \
-            --notes "Unsigned builds: on macOS right-click the app and choose Open the first time (or run \`xattr -dr com.apple.quarantine /Applications/postrust.app\`); on Windows choose More info, then Run anyway. Verify downloads with SHA256SUMS.txt."
+            --notes "SHA256SUMS.txt lists checksums. cosign signatures (*.cosign.bundle) and GitHub build attestations are added by the signing step a few minutes after publishing; see the README for how to verify. The apps are not Apple-notarized or Windows-signed: on macOS right-click the app and choose Open the first time (or run \`xattr -dr com.apple.quarantine /Applications/postrust.app\`); on Windows choose More info, then Run anyway."
           gh release edit "$tag" --draft=false
+
+  # Runs after the release is public, so a signing problem is visible (red run) without undoing or
+  # blocking the release. Signs the files exactly as users download them.
+  sign:
+    name: Sign release files
+    needs: [check, release]
+    if: needs.check.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload the signature bundles to the release
+      id-token: write # keyless signing identity (GitHub OIDC)
+      attestations: write # build provenance
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download the published assets
+        run: |
+          gh release download "v${VERSION}" --repo "$REPO" --dir assets \
+            --pattern 'postrust-*' --pattern 'SHA256SUMS.txt'
+          # A re-run may find signature bundles from an earlier partial run; never sign those.
+          rm -f assets/*.cosign.bundle
+          ls -la assets
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/*
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Sign with cosign (keyless) and verify
+        run: |
+          identity="^https://github.com/${REPO}/\.github/workflows/release\.yml@refs/heads/main$"
+          issuer="https://token.actions.githubusercontent.com"
+          for f in assets/*; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+            cosign verify-blob "$f" --bundle "${f}.cosign.bundle" \
+              --certificate-identity-regexp "$identity" --certificate-oidc-issuer "$issuer"
+          done
+
+      - name: Upload signatures
+        run: gh release upload "v${VERSION}" assets/*.cosign.bundle --repo "$REPO" --clobber

@@ -70,15 +70,16 @@ impl ResponseData {
             .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
             .map(|(_, v)| v.as_str())
     }
+}
 
-    /// Pretty-printed body when it parses as JSON, otherwise the raw text.
-    pub fn pretty_text(&self) -> String {
-        let text = self.text();
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
-            Err(_) => text,
-        }
+/// Pretty-printed `text` if it parses as JSON (key order and number precision preserved).
+pub fn pretty_json(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    // A bare `42` or `true` isn't worth a JSON view (and is common in plain-text bodies).
+    if !(value.is_object() || value.is_array()) {
+        return None;
     }
+    serde_json::to_string_pretty(&value).ok()
 }
 
 /// True when the text *starts with* `scheme://` (a `://` inside the query doesn't count).
@@ -296,6 +297,100 @@ fn collect_missing(req: &Request, vars_in: &HashMap<String, String>, critical_on
     missing
 }
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Requests carrying credential-like headers use the client that refuses cross-origin redirects.
+fn is_guarded(p: &Prepared) -> bool {
+    p.secret_header.is_some() || p.headers.iter().any(|(k, _)| is_sensitive_header(k))
+}
+
+/// application/x-www-form-urlencoded escaping, as reqwest applies to form keys and values.
+fn form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'*' | b'-' | b'.' | b'_' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// A copy-pasteable `curl` command equivalent to what `send` would do (variables already
+/// resolved). Uses POSIX single-quote escaping, so it targets sh/bash/zsh, not cmd/PowerShell.
+pub fn to_curl(p: &Prepared) -> String {
+    // send() refuses cross-origin redirects for credential-like headers, so don't add -L then.
+    let guarded = is_guarded(p);
+    let mut parts: Vec<String> = vec!["curl".into()];
+    if !guarded {
+        parts.push("-L".into());
+    }
+    // `[]{}` in a URL would otherwise be treated as a curl glob.
+    if p.url.contains(['[', ']', '{', '}']) {
+        parts.push("-g".into());
+    }
+    // An all-disabled form emits no data flag, so it must not count as a body (curl would then
+    // turn the request into a POST without any data).
+    let has_body = match &p.body {
+        PreparedBody::None => false,
+        PreparedBody::Raw(_) => true,
+        PreparedBody::Form(pairs) => !pairs.is_empty(),
+    };
+    match p.method {
+        // curl turns any request with a body into a POST unless told otherwise.
+        Method::Get if has_body => parts.push("-X GET".into()),
+        Method::Get => {}
+        // A body already makes curl POST, and then redirects behave like send() (302 -> GET).
+        Method::Post if has_body => {}
+        Method::Head if !has_body => parts.push("--head".into()),
+        m => parts.push(format!("-X {}", m.as_str())),
+    }
+    parts.push(shell_quote(&p.url));
+    let base = parts.len();
+    for (k, v) in &p.headers {
+        // curl drops `Name:` with no value; `Name;` is its syntax for sending an empty header.
+        let header = if v.is_empty() {
+            format!("{k};")
+        } else {
+            format!("{k}: {v}")
+        };
+        parts.push(format!("-H {}", shell_quote(&header)));
+    }
+    if let Some((u, pw)) = &p.basic {
+        parts.push(format!("-u {}", shell_quote(&format!("{u}:{pw}"))));
+    }
+    match &p.body {
+        PreparedBody::None => {}
+        PreparedBody::Raw(s) => {
+            let has_ct = p.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+            if !has_ct && looks_like_json(s) {
+                parts.push("-H 'Content-Type: application/json'".into());
+            } else if !has_ct {
+                // send() adds no Content-Type here, but curl would claim a form post.
+                parts.push("-H 'Content-Type:'".into());
+            }
+            parts.push(format!("--data-raw {}", shell_quote(s)));
+        }
+        PreparedBody::Form(pairs) => {
+            // curl encodes only the value, so pre-encode the key the way reqwest does.
+            for (k, v) in pairs {
+                parts.push(format!(
+                    "--data-urlencode {}",
+                    shell_quote(&format!("{}={v}", form_encode(k)))
+                ));
+            }
+        }
+    }
+    if parts.len() == base {
+        parts.join(" ")
+    } else {
+        parts.join(" \\\n  ")
+    }
+}
+
 fn reqwest_method(m: Method) -> reqwest::Method {
     match m {
         Method::Get => reqwest::Method::GET,
@@ -366,7 +461,7 @@ impl Http {
     }
 
     pub async fn send(&self, p: Prepared, timeout: Duration) -> Result<ResponseData> {
-        let guarded = p.secret_header.is_some() || p.headers.iter().any(|(k, _)| is_sensitive_header(k));
+        let guarded = is_guarded(&p);
         send_with(if guarded { &self.guarded } else { &self.plain }, p, timeout).await
     }
 }
@@ -663,6 +758,168 @@ mod tests {
     }
 
     #[test]
+    fn curl_for_a_simple_get_is_one_line() {
+        let mut r = Request::new("x");
+        r.url = "http://h.test/a b".into();
+        let p = prepare(&r, &vars(&[])).unwrap();
+        assert_eq!(to_curl(&p), "curl -L 'http://h.test/a%20b'");
+    }
+
+    #[test]
+    fn curl_covers_method_headers_auth_and_json_body() {
+        let mut r = Request::new("x");
+        r.method = Method::Post;
+        r.url = "http://h.test".into();
+        r.headers = vec![KeyValue::new("X-Id", "7")];
+        r.auth = Auth::Basic {
+            username: "u".into(),
+            password: "p w".into(),
+        };
+        r.body_kind = BodyKind::Raw;
+        r.body = r#"{"a":"it's"}"#.into();
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(curl.starts_with("curl \\\n  -L \\\n  'http://h.test/'"), "{curl}");
+        assert!(!curl.contains("-X POST"), "a body already makes curl POST: {curl}");
+        assert!(curl.contains("-H 'X-Id: 7'"), "{curl}");
+        assert!(curl.contains("-u 'u:p w'"), "{curl}");
+        assert!(curl.contains("-H 'Content-Type: application/json'"), "{curl}");
+        assert!(curl.contains(r#"--data-raw '{"a":"it'\''s"}'"#), "{curl}");
+    }
+
+    #[test]
+    fn curl_empty_form_and_empty_header_values() {
+        let mut r = Request::new("x");
+        r.method = Method::Post;
+        r.url = "http://h.test".into();
+        r.body_kind = BodyKind::Form;
+        let mut off = KeyValue::new("a", "1");
+        off.enabled = false;
+        r.form = vec![off];
+        r.headers = vec![KeyValue::new("X-Empty", "")];
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(
+            curl.contains("-X POST"),
+            "no data is emitted, so POST must be explicit: {curl}"
+        );
+        assert!(curl.contains("-H 'X-Empty;'"), "{curl}");
+        assert!(!curl.contains("X-Empty:"), "{curl}");
+    }
+
+    #[test]
+    fn curl_raw_text_body_does_not_claim_to_be_a_form() {
+        let mut r = Request::new("x");
+        r.method = Method::Post;
+        r.url = "http://h.test".into();
+        r.body_kind = BodyKind::Raw;
+        r.body = "<xml/>".into();
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(
+            curl.contains("-H 'Content-Type:'"),
+            "must suppress curl's default: {curl}"
+        );
+        r.headers = vec![KeyValue::new("Content-Type", "application/xml")];
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(!curl.contains("-H 'Content-Type:'"), "{curl}");
+        assert!(curl.contains("Content-Type: application/xml"), "{curl}");
+    }
+
+    #[test]
+    fn curl_methods_that_need_an_explicit_flag() {
+        let mut r = Request::new("x");
+        r.url = "http://h.test".into();
+        r.method = Method::Post; // no body: curl would send GET without -X
+        assert!(to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-X POST"));
+        for m in [Method::Put, Method::Patch, Method::Delete, Method::Options] {
+            r.method = m;
+            r.body_kind = BodyKind::Raw;
+            r.body = "{}".into();
+            assert!(to_curl(&prepare(&r, &vars(&[])).unwrap()).contains(&format!("-X {}", m.as_str())));
+        }
+        r.method = Method::Head;
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(!curl.contains("--head"), "--head conflicts with a body: {curl}");
+        assert!(curl.contains("-X HEAD"), "{curl}");
+    }
+
+    #[test]
+    fn curl_globoff_for_brackets_and_no_redirects_for_guarded_requests() {
+        let mut r = Request::new("x");
+        r.url = "http://h.test/items?filter[name]=x".into();
+        assert!(to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-g"));
+        r.url = "http://h.test/plain".into();
+        assert!(!to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-g"));
+
+        assert!(to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-L"));
+        r.auth = Auth::ApiKey {
+            name: "X-Key".into(),
+            value: "k".into(),
+        };
+        assert!(
+            !to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-L"),
+            "guarded: no cross-origin redirects"
+        );
+        r.auth = Auth::None;
+        r.headers = vec![KeyValue::new("X-Auth-Token", "t")];
+        assert!(!to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-L"));
+        r.headers = vec![KeyValue::new("Authorization", "Bearer t")];
+        assert!(
+            to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-L"),
+            "reqwest strips Authorization itself"
+        );
+    }
+
+    #[test]
+    fn curl_form_keys_are_encoded_like_reqwest() {
+        assert_eq!(form_encode("user name"), "user+name");
+        assert_eq!(form_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(form_encode("é-._*"), "%C3%A9-._*");
+        let mut r = Request::new("x");
+        r.url = "http://h.test".into();
+        r.method = Method::Post;
+        r.body_kind = BodyKind::Form;
+        r.form = vec![KeyValue::new("user name", "a b")];
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(curl.contains("--data-urlencode 'user+name=a b'"), "{curl}");
+    }
+
+    #[test]
+    fn curl_get_with_a_body_keeps_the_get_method() {
+        let mut r = Request::new("x");
+        r.url = "http://h.test".into();
+        r.body_kind = BodyKind::Raw;
+        r.body = "q".into();
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(curl.contains("-X GET"), "curl would otherwise send POST: {curl}");
+        r.body_kind = BodyKind::None;
+        assert!(!to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("-X"));
+    }
+
+    #[test]
+    fn curl_form_and_head_and_explicit_content_type() {
+        let mut r = Request::new("x");
+        r.method = Method::Put;
+        r.url = "http://h.test".into();
+        r.body_kind = BodyKind::Form;
+        r.form = vec![KeyValue::new("a", "1"), KeyValue::new("b", "x y")];
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(
+            curl.contains("--data-urlencode 'a=1'") && curl.contains("--data-urlencode 'b=x y'"),
+            "{curl}"
+        );
+
+        r.method = Method::Head;
+        r.body_kind = BodyKind::None;
+        assert!(to_curl(&prepare(&r, &vars(&[])).unwrap()).contains("--head"));
+
+        r.method = Method::Post;
+        r.headers = vec![KeyValue::new("content-type", "text/plain")];
+        r.body_kind = BodyKind::Raw;
+        r.body = "{}".into();
+        let curl = to_curl(&prepare(&r, &vars(&[])).unwrap());
+        assert!(!curl.contains("application/json"), "user content-type wins: {curl}");
+    }
+
+    #[test]
     fn sensitive_header_heuristic() {
         for h in ["X-API-Key", "x-auth-token", "X-Session-Id", "Client-Secret"] {
             assert!(is_sensitive_header(h), "{h}");
@@ -804,6 +1061,10 @@ mod tests {
             headers: vec![],
             body: br#"{"a":1}"#.to_vec(),
         };
-        assert_eq!(r.pretty_text(), "{\n  \"a\": 1\n}");
+        assert_eq!(pretty_json(&r.text()).unwrap(), "{\n  \"a\": 1\n}");
+        assert!(pretty_json("<html>").is_none());
+        assert!(pretty_json("42").is_none());
+        assert!(pretty_json("true").is_none());
+        assert!(pretty_json("\"s\"").is_none());
     }
 }

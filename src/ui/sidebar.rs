@@ -1,6 +1,7 @@
+use super::widgets;
 use crate::app::{App, RenameTarget};
 use crate::model::Request;
-use egui::{RichText, Ui};
+use egui::{Key, RichText, Ui};
 
 enum Action {
     Open(usize, usize),
@@ -14,54 +15,92 @@ enum Action {
 
 pub fn draw(app: &mut App, ui: &mut Ui) {
     let mut action = None;
+    let query = app.search.trim().to_lowercase();
+    let filtering = !query.is_empty();
 
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let w = (ui.available_width() - 70.0).max(60.0);
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut app.new_collection)
-                .hint_text("New collection")
-                .desired_width(w),
-        );
-        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (ui.button("Add").clicked() || enter) && !app.new_collection.trim().is_empty() {
-            action = Some(Action::NewCollection);
-        }
-    });
-    ui.separator();
+    ui.add_space(6.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut app.search)
+            .hint_text("Search requests")
+            .desired_width(f32::INFINITY),
+    );
+    ui.add_space(6.0);
 
     egui::ScrollArea::vertical()
         .id_salt("sidebar_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.label(RichText::new("Collections").strong());
-            if app.store.collections.is_empty() {
-                ui.weak("No collections yet. Save a request to create one.");
+            ui.horizontal(|ui| {
+                widgets::section_title(ui, "Collections");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("+").on_hover_text("New collection").clicked() {
+                        app.adding_collection = !app.adding_collection;
+                        app.focus_new_collection = app.adding_collection;
+                    }
+                });
+            });
+            if app.adding_collection {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut app.new_collection)
+                        .hint_text("Collection name, then Enter")
+                        .desired_width(f32::INFINITY),
+                );
+                // Focus once, so clicking elsewhere isn't fought over every frame.
+                if std::mem::take(&mut app.focus_new_collection) {
+                    r.request_focus();
+                }
+                // egui's text box takes Enter/Escape itself and drops focus, so look for "lost focus
+                // together with the key". Never while the palette owns the keyboard.
+                if r.lost_focus() && app.palette.is_none() {
+                    let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                    if enter && !app.new_collection.trim().is_empty() {
+                        action = Some(Action::NewCollection);
+                    } else if esc {
+                        app.adding_collection = false;
+                        app.new_collection.clear();
+                    }
+                }
             }
+
+            let mut shown_any = false;
             for (ci, coll) in app.store.collections.iter().enumerate() {
-                let header = egui::CollapsingHeader::new(format!("{} ({})", coll.name, coll.requests.len()))
-                    .id_salt(("coll", ci, &coll.name))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for (ri, req) in coll.requests.iter().enumerate() {
-                            let open = app.tabs.get(app.active).is_some_and(|t| t.source == Some((ci, ri)));
-                            let label = format!("{:<7}{}", req.method.as_str(), req.title());
-                            let resp = ui.selectable_label(open, RichText::new(label).monospace());
-                            if resp.clicked() {
-                                action = Some(Action::Open(ci, ri));
-                            }
-                            resp.context_menu(|ui| {
-                                if ui.button("Rename").clicked() {
-                                    action = Some(Action::Rename(RenameTarget::Request(ci, ri), req.name.clone()));
-                                    ui.close();
-                                }
-                                if ui.button("Delete").clicked() {
-                                    action = Some(Action::DeleteRequest(ci, ri));
-                                    ui.close();
-                                }
-                            });
+                // A collection whose name matches shows all of its requests.
+                let name_hit = filtering && coll.name.to_lowercase().contains(&query);
+                let visible: Vec<usize> = (0..coll.requests.len())
+                    .filter(|&ri| !filtering || name_hit || coll.requests[ri].matches(&query))
+                    .collect();
+                if filtering && visible.is_empty() {
+                    continue;
+                }
+                shown_any = true;
+                let header = egui::CollapsingHeader::new(
+                    RichText::new(format!("{} ({})", coll.name, coll.requests.len())).strong(),
+                )
+                // Filtering forces headers open; use separate state so that never overwrites the user's
+                // own expanded/collapsed choices.
+                .id_salt(("coll", ci, &coll.name, filtering))
+                .default_open(true)
+                .open(filtering.then_some(true))
+                .show(ui, |ui| {
+                    for &ri in &visible {
+                        let req = &coll.requests[ri];
+                        let open = app.tabs.get(app.active).is_some_and(|t| t.source == Some((ci, ri)));
+                        let resp = widgets::list_row(ui, open, req.method, &req.title());
+                        if resp.clicked() {
+                            action = Some(Action::Open(ci, ri));
                         }
-                    });
+                        resp.context_menu(|ui| {
+                            if ui.button("Rename").clicked() {
+                                action = Some(Action::Rename(RenameTarget::Request(ci, ri), req.name.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Delete").clicked() {
+                                action = Some(Action::DeleteRequest(ci, ri));
+                                ui.close();
+                            }
+                        });
+                    }
+                });
                 header.header_response.context_menu(|ui| {
                     if ui.button("Rename").clicked() {
                         action = Some(Action::Rename(RenameTarget::Collection(ci), coll.name.clone()));
@@ -73,22 +112,40 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
                     }
                 });
             }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("History").strong());
-                if !app.store.history.is_empty() && ui.small_button("Clear").clicked() {
-                    action = Some(Action::ClearHistory);
-                }
-            });
-            if app.store.history.is_empty() {
-                ui.weak("Sent requests show up here.");
+            if app.store.collections.is_empty() {
+                widgets::empty_state(ui, "No collections yet", "Save a request, or press + to add one");
+            } else if filtering && !shown_any {
+                widgets::empty_state(ui, "No matching collections", "Try a different search");
             }
-            for req in &app.store.history {
-                let label = format!("{:<7}{}", req.method.as_str(), req.url);
-                if ui.selectable_label(false, RichText::new(label).monospace()).clicked() {
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                widgets::section_title(ui, "History");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !app.store.history.is_empty() && ui.small_button("Clear").clicked() {
+                        action = Some(Action::ClearHistory);
+                    }
+                });
+            });
+            let mut history_shown = false;
+            for req in app.store.history.iter().filter(|r| !filtering || r.matches(&query)) {
+                history_shown = true;
+                let title = if req.url.is_empty() {
+                    req.title()
+                } else {
+                    req.url.clone()
+                };
+                if widgets::list_row(ui, false, req.method, &title).clicked() {
                     action = Some(Action::OpenHistory(req.clone()));
                 }
+            }
+            if !history_shown {
+                let hint = if filtering {
+                    "No matching history"
+                } else {
+                    "Sent requests show up here"
+                };
+                ui.weak(hint);
             }
         });
 
@@ -102,6 +159,7 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
         Some(Action::NewCollection) => {
             let name = std::mem::take(&mut app.new_collection);
             app.add_collection(&name);
+            app.adding_collection = false;
         }
         None => {}
     }
